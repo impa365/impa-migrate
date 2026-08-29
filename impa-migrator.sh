@@ -592,6 +592,13 @@ transfer_volume() {
   size=$(echo "$size_line" | awk -F'\t' '{print $2}')
   size=${size:-0}
 
+  # Portainer guarda Swarm ID / stacks no volume — no destino o Swarm é novo.
+  # Copiar portainer_data deixa UI órfã; stacks sobem pelos YAMLs + docker stack deploy.
+  if [ "$vol" = "portainer_data" ]; then
+    warn "Pulando conteúdo de portainer_data (MVP: recria admin; stacks vêm dos YAMLs)"
+    return 0
+  fi
+
   if [ ! -d "$src" ]; then
     warn "Volume sem _data local: $vol (pulando conteúdo)"
     return 0
