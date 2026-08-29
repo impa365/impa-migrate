@@ -34,15 +34,16 @@ function wantsScript(request, pathname) {
 }
 
 async function serveScript() {
-  const upstream = await fetch(SCRIPT_URL, {
-    cf: { cacheTtl: 60, cacheEverything: true },
+  // ?v= evita servir script antigo do cache da edge após bump de versão
+  const upstream = await fetch(`${SCRIPT_URL}?v=${VERSION}`, {
+    cf: { cacheTtl: 300, cacheEverything: true },
   });
   const body = await upstream.text();
   return new Response(body, {
     status: upstream.status,
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "public, max-age=60",
+      "Cache-Control": "public, max-age=60, must-revalidate",
       "X-IMPA-Migrator": "script",
       "X-IMPA-Version": VERSION,
     },
