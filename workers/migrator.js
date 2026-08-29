@@ -1,8 +1,8 @@
 /**
  * IMPA Migrator edge worker
- * - Browser  → landing page
- * - curl/wget → impa-migrator.sh (GitHub raw)
- * - /install  → always the script
+ * - Browser  → landing (visual alinhado a impa365.com)
+ * - curl/wget → impa-migrator.sh
+ * - /install  → sempre o script
  */
 const SCRIPT_URL =
   "https://raw.githubusercontent.com/impa365/impa-migrate/main/impa-migrator.sh";
@@ -28,7 +28,6 @@ function wantsScript(request, pathname) {
     return true;
   }
   const accept = (request.headers.get("Accept") || "").toLowerCase();
-  // Browsers send text/html; curl typically sends */*
   if (accept.includes("text/html")) return false;
   if (!ua.includes("mozilla")) return true;
   return false;
@@ -56,185 +55,350 @@ function landingPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>IMPA Migrator — migre sua VPS Docker</title>
-  <meta name="description" content="One-liner da IMPA 365 para migrar Docker Swarm, Portainer, stacks e volumes entre VPS." />
+  <title>IMPA Migrator v${VERSION} — Migre sua VPS Docker</title>
+  <meta name="description" content="Migre Docker Swarm, Portainer, stacks e volumes entre VPS com um comando. Feito pela IMPA 365." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg0: #07131a;
-      --bg1: #0c2430;
-      --ink: #e8f2f4;
-      --muted: #9bb4bc;
-      --accent: #2fd3a4;
-      --accent-2: #f0b429;
-      --line: rgba(232, 242, 244, 0.12);
-      --glow: rgba(47, 211, 164, 0.22);
+      --bg: hsl(240 10% 4%);
+      --bg-elev: hsl(240 10% 6%);
+      --fg: hsl(0 0% 98%);
+      --muted: hsl(240 5% 64%);
+      --primary: hsl(263 70% 50%);
+      --primary-glow: hsla(263, 70%, 50%, 0.35);
+      --cyan: hsl(180 100% 50%);
+      --cyan-dim: hsla(180, 100%, 50%, 0.15);
+      --border: hsla(263, 50%, 30%, 0.55);
+      --radius: 0.75rem;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html { scroll-behavior: smooth; }
     body {
       min-height: 100vh;
-      font-family: "Instrument Sans", system-ui, sans-serif;
-      color: var(--ink);
+      font-family: "Space Grotesk", system-ui, sans-serif;
+      color: var(--fg);
       background:
-        radial-gradient(1000px 600px at 12% -10%, var(--glow), transparent 55%),
-        radial-gradient(800px 500px at 95% 10%, rgba(240, 180, 41, 0.12), transparent 50%),
-        linear-gradient(165deg, var(--bg0), var(--bg1) 45%, #081820);
-      line-height: 1.5;
+        radial-gradient(900px 520px at 15% -5%, var(--primary-glow), transparent 55%),
+        radial-gradient(700px 420px at 90% 0%, var(--cyan-dim), transparent 50%),
+        var(--bg);
+      line-height: 1.55;
     }
-    .wrap { width: min(1080px, calc(100% - 2.5rem)); margin: 0 auto; }
-    header {
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { width: min(1100px, calc(100% - 2rem)); margin: 0 auto; }
+
+    /* Nav */
+    .nav {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 1.4rem 0 0.5rem;
+      padding: 1.25rem 0;
     }
-    .brand {
-      font-weight: 700; letter-spacing: 0.04em; font-size: 0.95rem;
-      text-transform: uppercase;
+    .logo {
+      font-family: Orbitron, sans-serif;
+      font-weight: 700; font-size: 1rem; letter-spacing: 0.06em;
+      color: var(--fg); text-decoration: none;
     }
-    .brand span { color: var(--accent); }
-    .ver {
-      color: var(--muted); font-size: 0.85rem;
-      border: 1px solid var(--line); border-radius: 999px;
-      padding: 0.35rem 0.75rem;
+    .logo span { color: var(--cyan); }
+    .nav-links { display: flex; gap: 1.25rem; align-items: center; font-size: 0.9rem; color: var(--muted); }
+    .nav-links a { color: var(--muted); text-decoration: none; }
+    .nav-links a:hover { color: var(--fg); }
+    .pill {
+      font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em;
+      border: 1px solid var(--border); border-radius: 999px;
+      padding: 0.35rem 0.7rem; color: var(--cyan);
+      background: hsla(263, 70%, 50%, 0.12);
     }
+
+    /* Hero — composição única estilo Orion + IMPA */
     .hero {
-      min-height: calc(100vh - 5rem);
-      display: grid; align-content: center;
-      padding: 2.5rem 0 4rem;
-      gap: 1.25rem;
+      padding: 3.5rem 0 4rem;
+      text-align: center;
+      display: flex; flex-direction: column; align-items: center; gap: 1.1rem;
+    }
+    .eyebrow {
+      font-family: Orbitron, sans-serif;
+      font-size: 0.72rem; font-weight: 600; letter-spacing: 0.18em;
+      text-transform: uppercase; color: var(--cyan);
     }
     .hero h1 {
-      font-family: Fraunces, Georgia, serif;
+      font-family: Orbitron, sans-serif;
       font-weight: 700;
-      font-size: clamp(2.6rem, 7vw, 4.6rem);
-      line-height: 1.02;
-      max-width: 12ch;
-      letter-spacing: -0.02em;
+      font-size: clamp(1.85rem, 5.2vw, 3.15rem);
+      line-height: 1.15;
+      letter-spacing: 0.02em;
+      max-width: 18ch;
     }
-    .hero p.lead {
-      max-width: 38rem;
+    .hero h1 em {
+      font-style: normal;
+      background: linear-gradient(90deg, var(--cyan), #b57bff, var(--primary));
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+    }
+    .lead {
+      max-width: 36rem;
       color: var(--muted);
-      font-size: clamp(1.05rem, 2.2vw, 1.25rem);
+      font-size: clamp(1rem, 2vw, 1.15rem);
     }
-    .cmd {
+
+    /* Terminal / copy — peça central tipo Orion */
+    .terminal {
+      width: min(640px, 100%);
       margin-top: 0.75rem;
-      display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: stretch;
-      max-width: 46rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg-elev);
+      box-shadow: 0 0 0 1px hsla(263,70%,50%,0.08), 0 24px 80px -30px var(--primary-glow);
+      overflow: hidden;
+      text-align: left;
     }
-    .cmd code {
-      flex: 1 1 280px;
-      background: rgba(0,0,0,0.35);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 1rem 1.1rem;
-      font-size: 0.92rem;
-      overflow-x: auto;
-      white-space: nowrap;
-      color: #d7fff1;
+    .terminal-bar {
+      display: flex; align-items: center; gap: 0.4rem;
+      padding: 0.65rem 0.9rem;
+      border-bottom: 1px solid var(--border);
+      background: hsl(240 10% 5%);
     }
-    .cmd button {
+    .dot { width: 9px; height: 9px; border-radius: 50%; }
+    .dot.r { background: #ff5f57; }
+    .dot.y { background: #febc2e; }
+    .dot.g { background: #28c840; }
+    .terminal-title {
+      margin-left: 0.5rem; font-size: 0.75rem; color: var(--muted);
+      font-family: Orbitron, sans-serif; letter-spacing: 0.06em;
+    }
+    .terminal-body {
+      display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+      padding: 1rem 1rem 1.1rem;
+    }
+    .terminal-body code {
+      flex: 1 1 220px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.88rem;
+      color: var(--cyan);
+      word-break: break-all;
+    }
+    .btn-copy {
       border: 0; cursor: pointer;
-      background: var(--accent); color: #042018;
-      font-weight: 700; font-size: 0.95rem;
-      border-radius: 12px; padding: 0 1.25rem;
-      min-height: 52px;
+      font-family: "Space Grotesk", sans-serif;
+      font-weight: 700; font-size: 0.9rem;
+      padding: 0.7rem 1.15rem;
+      border-radius: calc(var(--radius) - 2px);
+      color: #fff;
+      background: linear-gradient(135deg, var(--primary), #7c3aed);
+      box-shadow: 0 0 24px var(--primary-glow);
       transition: transform 0.15s ease, filter 0.15s ease;
     }
-    .cmd button:hover { transform: translateY(-1px); filter: brightness(1.05); }
-    .cmd button.copied { background: var(--accent-2); color: #1a1200; }
-    .note { color: var(--muted); font-size: 0.92rem; }
-    .note strong { color: var(--ink); font-weight: 600; }
-    section.steps {
-      padding: 3.5rem 0 4.5rem;
-      border-top: 1px solid var(--line);
+    .btn-copy:hover { transform: translateY(-1px); filter: brightness(1.08); }
+    .btn-copy.ok {
+      background: linear-gradient(135deg, hsl(180 80% 35%), hsl(180 100% 40%));
     }
-    section.steps h2 {
-      font-family: Fraunces, Georgia, serif;
-      font-size: clamp(1.8rem, 4vw, 2.4rem);
-      margin-bottom: 1.75rem;
+
+    .req {
+      margin-top: 0.35rem;
+      font-size: 0.88rem; color: var(--muted);
+      max-width: 34rem;
     }
-    .grid {
+    .req strong { color: var(--fg); font-weight: 600; }
+
+    /* Stats strip — leve, não card-heavy */
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      margin: 0.5rem 0 0;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--border);
+      max-width: 720px;
+      width: 100%;
+    }
+    .stat {
+      background: var(--bg-elev);
+      padding: 1.15rem 1rem;
+      text-align: center;
+    }
+    .stat b {
+      display: block;
+      font-family: Orbitron, sans-serif;
+      font-size: 1.35rem;
+      color: var(--cyan);
+      margin-bottom: 0.2rem;
+    }
+    .stat span { font-size: 0.82rem; color: var(--muted); }
+
+    /* Steps */
+    .section {
+      padding: 3.75rem 0 4rem;
+      border-top: 1px solid var(--border);
+    }
+    .section-head {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    .section-head h2 {
+      font-family: Orbitron, sans-serif;
+      font-size: clamp(1.35rem, 3vw, 1.85rem);
+      letter-spacing: 0.04em;
+      margin-bottom: 0.5rem;
+    }
+    .section-head p { color: var(--muted); max-width: 32rem; margin: 0 auto; }
+
+    .steps {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 1.25rem;
     }
-    @media (max-width: 800px) {
-      .grid { grid-template-columns: 1fr; }
-    }
     .step {
-      padding: 1.25rem 0;
-      border-top: 1px solid var(--line);
+      padding: 1.5rem 1.25rem 1.6rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, hsla(263,70%,50%,0.08), transparent 55%), var(--bg-elev);
     }
     .step .n {
-      color: var(--accent); font-weight: 700; font-size: 0.85rem;
-      letter-spacing: 0.08em; text-transform: uppercase;
-      margin-bottom: 0.5rem;
+      font-family: Orbitron, sans-serif;
+      font-size: 0.75rem; letter-spacing: 0.12em;
+      color: var(--cyan); margin-bottom: 0.75rem;
     }
-    .step h3 { font-size: 1.15rem; margin-bottom: 0.35rem; }
-    .step p { color: var(--muted); font-size: 0.98rem; }
+    .step h3 {
+      font-size: 1.05rem; font-weight: 600;
+      margin-bottom: 0.45rem;
+    }
+    .step p { color: var(--muted); font-size: 0.92rem; }
+
+    /* FAQ simples */
+    .faq { max-width: 720px; margin: 0 auto; }
+    details {
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 0;
+    }
+    details summary {
+      cursor: pointer; list-style: none;
+      font-weight: 600; font-size: 1rem;
+      display: flex; justify-content: space-between; gap: 1rem;
+    }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::after { content: "+"; color: var(--cyan); font-weight: 700; }
+    details[open] summary::after { content: "–"; }
+    details p {
+      margin-top: 0.65rem; color: var(--muted); font-size: 0.95rem;
+    }
+
     footer {
-      border-top: 1px solid var(--line);
-      padding: 1.5rem 0 2.5rem;
-      color: var(--muted); font-size: 0.9rem;
+      border-top: 1px solid var(--border);
+      padding: 1.75rem 0 2.5rem;
       display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem;
       justify-content: space-between;
+      color: var(--muted); font-size: 0.88rem;
     }
-    footer a { color: var(--accent); text-decoration: none; }
-    footer a:hover { text-decoration: underline; }
+    footer .brand-f {
+      font-family: Orbitron, sans-serif; letter-spacing: 0.06em; color: var(--fg);
+    }
+
+    @media (max-width: 800px) {
+      .steps, .stats { grid-template-columns: 1fr; }
+      .nav-links .hide-sm { display: none; }
+      .hero { padding-top: 2.25rem; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <div class="brand">IMPA <span>365</span> · Migrator</div>
-      <div class="ver">v. ${VERSION}</div>
-    </header>
-
-    <main class="hero">
-      <h1>Migre sua VPS Docker em um comando.</h1>
-      <p class="lead">
-        Leva Swarm, Portainer, stacks e volumes para uma VPS nova — sem reinstalar tudo na mão.
-        Rode na origem. Destino limpo. A IMPA cuida do resto.
-      </p>
-      <div class="cmd">
-        <code id="install-cmd">${INSTALL_CMD}</code>
-        <button type="button" id="copy-btn">Copiar código</button>
+    <nav class="nav">
+      <a class="logo" href="https://impa365.com">IMPA <span>365</span></a>
+      <div class="nav-links">
+        <a class="hide-sm" href="https://impa365.com">Site</a>
+        <a class="hide-sm" href="https://github.com/impa365/impa-migrate">GitHub</a>
+        <span class="pill">MIGRATÖR v${VERSION}</span>
       </div>
-      <p class="note">
-        <strong>Requisitos:</strong> origem com Docker Swarm · destino Debian/Ubuntu limpo · mesma arquitetura.
+    </nav>
+
+    <header class="hero">
+      <p class="eyebrow">Powered by IMPA 365</p>
+      <h1>Migre sua VPS Docker em <em>segundos</em></h1>
+      <p class="lead">
+        Um comando na VPS antiga. Swarm, Portainer, stacks e volumes na VPS nova —
+        sem reinstalar tudo na mão.
+      </p>
+
+      <div class="terminal" aria-label="Comando de instalação">
+        <div class="terminal-bar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="terminal-title">SSH · root@origem</span>
+        </div>
+        <div class="terminal-body">
+          <code id="install-cmd">${INSTALL_CMD}</code>
+          <button type="button" class="btn-copy" id="copy-btn">Copiar código</button>
+        </div>
+      </div>
+
+      <p class="req">
+        <strong>Obs:</strong> origem com Docker Swarm · destino Debian/Ubuntu <strong>limpo</strong> · mesma arch.
         Backup da VPS altamente recomendado.
       </p>
-    </main>
 
-    <section class="steps" id="como">
-      <h2>Três passos.</h2>
-      <div class="grid">
+      <div class="stats" aria-label="Destaques">
+        <div class="stat"><b>1 cmd</b><span>One-liner no SSH</span></div>
+        <div class="stat"><b>Swarm</b><span>Stacks + volumes</span></div>
+        <div class="stat"><b>Teste</b><span>Origem pode continuar viva</span></div>
+      </div>
+    </header>
+
+    <section class="section" id="como">
+      <div class="section-head">
+        <h2>Veja como é simples</h2>
+        <p>Três passos. Sem painel. Sem mistério.</p>
+      </div>
+      <div class="steps">
         <article class="step">
-          <div class="n">Passo 01</div>
-          <h3>Copie o comando</h3>
-          <p>Cole no SSH da VPS antiga (root). O script baixa e inicia o wizard.</p>
+          <div class="n">PASSO 01</div>
+          <h3>Copie o código</h3>
+          <p>Cole no terminal SSH da VPS de origem (root). O wizard sobe sozinho.</p>
         </article>
         <article class="step">
-          <div class="n">Passo 02</div>
+          <div class="n">PASSO 02</div>
           <h3>Informe a VPS nova</h3>
-          <p>IP, SSH e modo teste ou cutover. Confirme o backup e digite MIGRAR.</p>
+          <p>IP, SSH, modo teste ou cutover. Confirme o backup e digite MIGRAR.</p>
         </article>
         <article class="step">
-          <div class="n">Passo 03</div>
+          <div class="n">PASSO 03</div>
           <h3>Aponte o DNS</h3>
-          <p>Quando validar, mude os A records para o IP novo. A origem não é apagada.</p>
+          <p>Valide a nova VPS e mude os A records. A origem não é apagada.</p>
         </article>
       </div>
     </section>
 
+    <section class="section" id="faq">
+      <div class="section-head">
+        <h2>Dúvidas frequentes</h2>
+        <p>O essencial antes de rodar.</p>
+      </div>
+      <div class="faq">
+        <details>
+          <summary>Precisa ter instalado com SetupOrion?</summary>
+          <p>Não. Qualquer VPS com Docker Swarm (Portainer opcional) serve. Não exigimos instalador específico.</p>
+        </details>
+        <details>
+          <summary>A VPS de destino pode ter Docker?</summary>
+          <p>Não. Tem que ser limpa (Debian/Ubuntu novo). Se já tiver Docker, o migrador aborta de propósito.</p>
+        </details>
+        <details>
+          <summary>Bancos (Postgres, Chatwoot…) vêm junto?</summary>
+          <p>Sim. Volumes nomeados são copiados (incluindo dados de banco). A origem é pausada na cópia para consistência.</p>
+        </details>
+        <details>
+          <summary>Posso testar sem “matar” a VPS antiga?</summary>
+          <p>Sim. No modo teste a origem é religada depois da transferência. Você aponta o DNS e pode voltar se precisar.</p>
+        </details>
+      </div>
+    </section>
+
     <footer>
-      <div>© IMPA 365 — créditos ao usar o Migrator.</div>
+      <div><span class="brand-f">IMPA 365</span> · créditos ao usar o Migrator</div>
       <div>
-        <a href="https://impa365.com" rel="noopener">impa365.com</a>
+        <a href="https://impa365.com">impa365.com</a>
         ·
-        <a href="https://github.com/impa365/impa-migrate" rel="noopener">GitHub</a>
+        <a href="https://github.com/impa365/impa-migrate">GitHub</a>
         ·
         <a href="/install">/install</a>
       </div>
@@ -247,10 +411,10 @@ function landingPage() {
       try {
         await navigator.clipboard.writeText(cmd);
         btn.textContent = "Copiado!";
-        btn.classList.add("copied");
+        btn.classList.add("ok");
         setTimeout(() => {
           btn.textContent = "Copiar código";
-          btn.classList.remove("copied");
+          btn.classList.remove("ok");
         }, 1800);
       } catch (e) {
         btn.textContent = "Selecione e copie";
@@ -259,10 +423,11 @@ function landingPage() {
   </script>
 </body>
 </html>`;
+
   return new Response(html, {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "public, max-age=300",
+      "Cache-Control": "public, max-age=60",
       "X-IMPA-Migrator": "landing",
       "X-IMPA-Version": VERSION,
     },
