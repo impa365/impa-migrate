@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.3"
+IMPA_MIGRATOR_VERSION="1.1.4"
 
 # =============================================================================
 # Cores / UI
@@ -756,7 +756,7 @@ show_summary_and_confirm() {
     echo -e "  6. Origem permanece pausada (intacta para rollback)"
   fi
   echo -e "  ${AMARELO}Obs:${RESET} portainer_data NÃO é clonado (Swarm ID novo)."
-  echo -e "       As stacks vêm do export da API + arquivos em /root."
+  echo -e "       O admin é recriado com as credenciais de dados_portainer (mesmo login)."
   echo ""
   echo -e "  ${VERMELHO}Após a migração, aponte o DNS A dos domínios para ${DEST_IP}${RESET}"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
@@ -1061,6 +1061,66 @@ transfer_exported_stacks() {
 # =============================================================================
 # Restore stacks
 # =============================================================================
+# Traefik v3.5 + Docker 29 quebra o provider Swarm (API 1.24 vs 1.40+) → 404 em tudo.
+patch_traefik_for_modern_docker() {
+  step "Ajustando Traefik para Docker 29+"
+  remote 'bash -s' <<'PATCH' || { warn "Não foi possível ajustar traefik.yaml"; return 1; }
+set -e
+[ -f /root/traefik.yaml ] || exit 0
+python3 <<'PY'
+from pathlib import Path
+import re
+
+p = Path("/root/traefik.yaml")
+t = p.read_text(encoding="utf-8")
+orig = t
+
+if not re.search(r"traefik:v3\.(?:6|7)", t):
+    t = re.sub(r"image:\s*traefik:v[\d.]+", "image: traefik:v3.6.1", t)
+
+for rm in (
+    '      - "--providers.docker.endpoint=unix:///var/run/docker.sock"\n',
+    '      - "--providers.docker.exposedbydefault=false"\n',
+):
+    t = t.replace(rm, "")
+
+t = t.replace(
+    '      - "--providers.docker.network=OrionNet" ## Nome da rede interna\n', ""
+)
+t = t.replace('      - "--providers.docker.network=OrionNet"\n', "")
+
+swarm = '      - "--providers.swarm=true"\n'
+swarm_cfg = (
+    '      - "--providers.swarm=true"\n'
+    '      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"\n'
+    '      - "--providers.swarm.exposedbydefault=false"\n'
+    '      - "--providers.swarm.network=OrionNet"\n'
+)
+if swarm in t and "providers.swarm.endpoint" not in t:
+    t = t.replace(swarm, swarm_cfg)
+
+if "DOCKER_API_VERSION" not in t:
+    needle = '    volumes:\n      - "vol_certificates:/etc/traefik/letsencrypt"'
+    insert = (
+        "    environment:\n"
+        "      - DOCKER_API_VERSION=1.45\n"
+        "\n"
+        "    volumes:\n"
+        '      - "vol_certificates:/etc/traefik/letsencrypt"'
+    )
+    if needle in t:
+        t = t.replace(needle, insert)
+
+if t != orig:
+    p.write_text(t, encoding="utf-8")
+    print("PATCHED")
+else:
+    print("ALREADY_OK")
+PY
+PATCH
+  ok "Traefik compatível com Docker 29+ (v3.6.1 + provider Swarm)"
+}
+
 deploy_stack_remote() {
   local name="$1"
   local file="$2"
@@ -1094,6 +1154,8 @@ find_stack_yaml() {
 
 restore_stacks() {
   step "Restaurando stacks no destino"
+
+  patch_traefik_for_modern_docker || true
 
   local deployed_list="$STATE_DIR/deployed.txt"
   local failed_list="$STATE_DIR/deploy_failed.txt"
@@ -1169,38 +1231,55 @@ restore_stacks() {
 }
 
 init_portainer_admin() {
-  step "Recriando admin do Portainer (Swarm ID novo)"
-  if [ -z "$PORTAINER_URL" ] || [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
+  step "Recriando admin do Portainer (mesmo login de dados_vps)"
+  if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
     warn "Sem credenciais em dados_portainer — crie o admin manualmente no Portainer novo."
     return 1
   fi
 
-  # Remove https:// se houver
-  local url="$PORTAINER_URL"
-  url="${url#https://}"
-  url="${url#http://}"
+  local domain="${PORTAINER_URL#https://}"
+  domain="${domain#http://}"
+  domain="${domain%/}"
+  [ -z "$domain" ] && domain="portainer.local"
 
-  info "Tentando admin/init em https://$url ..."
-  local i
-  for i in 1 2 3 4 5; do
-    local response
-    response=$(curl -k -s -X POST "https://$url/api/users/admin/init" \
-      -H "Content-Type: application/json" \
-      -d "{\"Username\": \"$PORTAINER_USER\", \"Password\": \"$PORTAINER_PASS\"}" 2>/dev/null || true)
-    if echo "$response" | grep -q "\"Username\""; then
-      ok "Admin Portainer criado ($PORTAINER_USER)"
+  local payload_b64 setup_token response i
+  if command -v jq >/dev/null 2>&1; then
+    payload_b64=$(jq -n --arg u "$PORTAINER_USER" --arg p "$PORTAINER_PASS" '{Username:$u,Password:$p}' | base64 -w0 2>/dev/null || jq -n --arg u "$PORTAINER_USER" --arg p "$PORTAINER_PASS" '{Username:$u,Password:$p}' | base64)
+  else
+    payload_b64=$(printf '%s' "{\"Username\":\"$PORTAINER_USER\",\"Password\":\"$PORTAINER_PASS\"}" | base64 -w0 2>/dev/null || printf '%s' "{\"Username\":\"$PORTAINER_USER\",\"Password\":\"$PORTAINER_PASS\"}" | base64)
+  fi
+
+  for i in $(seq 1 12); do
+    setup_token=$(remote "docker service logs portainer_portainer 2>&1 | grep -oE 'setup_token=[a-f0-9]+' | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n')
+
+    # Via Traefik local — não depende de DNS público apontar pro destino
+    if [ -n "$setup_token" ]; then
+      response=$(remote "payload=\$(echo '$payload_b64' | base64 -d); curl -sk -X POST 'https://127.0.0.1/api/users/admin/init' \
+        -H 'Host: $domain' -H 'Content-Type: application/json' -H 'X-Setup-Token: $setup_token' \
+        -d \"\$payload\"" 2>/dev/null || true)
+    else
+      response=$(remote "payload=\$(echo '$payload_b64' | base64 -d); curl -sk -X POST 'https://127.0.0.1/api/users/admin/init' \
+        -H 'Host: $domain' -H 'Content-Type: application/json' \
+        -d \"\$payload\"" 2>/dev/null || true)
+    fi
+
+    if echo "$response" | grep -q '"Username"'; then
+      ok "Admin Portainer criado: $PORTAINER_USER (mesma senha de dados_portainer)"
+      info "Você não precisa do setup token — já entrou com o login antigo."
       return 0
     fi
-    # Já existe admin
-    if echo "$response" | grep -qi 'already'; then
-      warn "Admin já existe no Portainer — use as credenciais atuais do volume ou reset."
+    if echo "$response" | grep -qiE 'already|exists|initialized'; then
+      ok "Admin Portainer já existe — use $PORTAINER_USER (dados_portainer)"
       return 0
     fi
-    info "Tentativa $i/5 — aguardando DNS/Traefik (DNS ainda pode apontar para IP antigo)"
-    sleep 10
+
+    info "Tentativa $i/12 — aguardando Portainer/Traefik..."
+    sleep 6
   done
-  warn "Não foi possível init via API (normal se DNS ainda aponta para a origem)."
-  warn "Acesse Portainer no IP novo após apontar o DNS, ou via IP: se a stack publicar porta."
+
+  warn "Não foi possível criar o admin automaticamente."
+  warn "Crie manualmente com o MESMO usuário/senha de dados_portainer"
+  warn "ou use o setup_token nos logs: docker service logs portainer_portainer"
   return 1
 }
 
