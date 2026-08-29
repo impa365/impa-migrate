@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.2"
+IMPA_MIGRATOR_VERSION="1.1.3"
 
 # =============================================================================
 # Cores / UI
@@ -285,6 +285,12 @@ build_ssh() {
 }
 
 remote() {
+  # -n evita o SSH roubar stdin (quebrava loops e deploy parcial de stacks)
+  "${SSH_BASE[@]}" -n "${DEST_USER}@${DEST_IP}" "$@"
+}
+
+remote_stream() {
+  # Sem -n: usado quando stdin vem de pipe (tar | ssh …)
   "${SSH_BASE[@]}" "${DEST_USER}@${DEST_IP}" "$@"
 }
 
@@ -811,8 +817,13 @@ REMOTE
 
   # Volumes vazios
   step "Criando volumes no destino"
+  local vol_total vol_i
+  vol_total=$(wc -l < "$VOLUMES_FILE" | tr -d ' ')
+  vol_i=0
   while IFS= read -r vol || [ -n "$vol" ]; do
     [ -z "$vol" ] && continue
+    vol_i=$((vol_i + 1))
+    echo -e "${AMARELO}[$vol_i/$vol_total]${RESET} ${BRANCO}$vol${RESET}"
     if remote "docker volume inspect '$vol' >/dev/null 2>&1"; then
       ok "Volume já existe: $vol"
     else
@@ -928,12 +939,12 @@ transfer_volume() {
   local max=3
   while [ "$attempt" -le "$max" ]; do
     if command -v pv >/dev/null 2>&1 && [ "$size" -gt 0 ]; then
-      if tar -C "$src" -cf - . 2>/dev/null | pv -s "$size" | remote "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
+      if tar -C "$src" -cf - . 2>/dev/null | pv -s "$size" | remote_stream "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
         ok "Volume $vol transferido"
         return 0
       fi
     else
-      if tar -C "$src" -cf - . 2>/dev/null | remote "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
+      if tar -C "$src" -cf - . 2>/dev/null | remote_stream "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
         ok "Volume $vol transferido ($(human_bytes "$size"))"
         return 0
       fi
@@ -969,7 +980,7 @@ transfer_root() {
     if command -v pv >/dev/null 2>&1 && [ "${ROOT_BYTES:-0}" -gt 0 ]; then
       if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
         | pv -s "$ROOT_BYTES" \
-        | remote "tar -C /root -xf -"; then
+        | remote_stream "tar -C /root -xf -"; then
         ok "Pasta /root transferida ($ROOT_HUMAN)"
         # Sanity checks
         remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
@@ -980,7 +991,7 @@ transfer_root() {
       fi
     else
       if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
-        | remote "tar -C /root -xf -"; then
+        | remote_stream "tar -C /root -xf -"; then
         ok "Pasta /root transferida ($ROOT_HUMAN)"
         remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
         local yaml_dest
@@ -1020,25 +1031,29 @@ transfer_exported_stacks() {
     return 0
   fi
 
-  remote "mkdir -p /root /root/impa-exported-stacks"
+  remote "mkdir -p /root/impa-exported-stacks"
 
-  local name f
+  if tar -C "$EXPORTED_STACKS_DIR" -cf - . 2>/dev/null \
+    | remote_stream "tar -C /root/impa-exported-stacks -xf -"; then
+    ok "Pacote Portainer enviado ($PORTAINER_EXPORT_COUNT stack(s))"
+  else
+    off "Falha ao enviar stacks exportadas do Portainer"
+    return 1
+  fi
+
+  local name
   while IFS= read -r name || [ -n "$name" ]; do
     [ -z "$name" ] && continue
-    f="$EXPORTED_STACKS_DIR/${name}.yaml"
-    [ -f "$f" ] || continue
-
-    if "${SCP_BASE[@]}" "$f" "${DEST_USER}@${DEST_IP}:/root/impa-exported-stacks/${name}.yaml"; then
-      # Se /root ainda não tem esse YAML, coloca lá também (fonte do deploy)
-      if ! remote "test -f /root/${name}.yaml -o -f /root/${name}.yml"; then
+    if ! remote "test -f /root/${name}.yaml -o -f /root/${name}.yml"; then
+      if remote "test -f /root/impa-exported-stacks/${name}.yaml"; then
         remote "cp /root/impa-exported-stacks/${name}.yaml /root/${name}.yaml" \
           && ok "  $name → /root/${name}.yaml (veio do Portainer)" \
           || off "  Falha ao copiar $name para /root"
       else
-        ok "  $name (backup em impa-exported-stacks; /root já tinha YAML)"
+        warn "  $name exportado mas YAML ausente no destino"
       fi
     else
-      off "  Falha SCP: $name"
+      ok "  $name (backup em impa-exported-stacks; /root já tinha YAML)"
     fi
   done < "$EXPORTED_STACKS_LIST"
 }
@@ -1058,72 +1073,99 @@ deploy_stack_remote() {
   return 1
 }
 
+find_stack_yaml() {
+  local stack="$1"
+  if remote "test -f /root/${stack}.yaml"; then
+    echo "${stack}.yaml"
+    return 0
+  fi
+  if remote "test -f /root/${stack}.yml"; then
+    echo "${stack}.yml"
+    return 0
+  fi
+  if remote "test -f /root/impa-exported-stacks/${stack}.yaml"; then
+    remote "cp /root/impa-exported-stacks/${stack}.yaml /root/${stack}.yaml" \
+      || return 1
+    echo "${stack}.yaml"
+    return 0
+  fi
+  return 1
+}
+
 restore_stacks() {
   step "Restaurando stacks no destino"
 
-  # Ordem: traefik → portainer → resto
   local deployed_list="$STATE_DIR/deployed.txt"
+  local failed_list="$STATE_DIR/deploy_failed.txt"
   : > "$deployed_list"
+  : > "$failed_list"
 
-  if [ -f /root/traefik.yaml ] || remote "test -f /root/traefik.yaml"; then
-    deploy_stack_remote "traefik" "traefik.yaml" && echo traefik >> "$deployed_list"
-    info "Aguardando Traefik estabilizar (20s)..."
-    sleep 20
-  else
-    warn "traefik.yaml não encontrado — pulando Traefik"
-  fi
+  local stack_total deploy_i yaml_file
+  stack_total=$(wc -l < "$STACKS_FILE" | tr -d ' ')
+  deploy_i=0
 
-  if remote "test -f /root/portainer.yaml"; then
-    # Não restauramos portainer_data do volume antigo como fonte de stacks
-    # (Swarm ID muda). Volume portainer_data pode ter sido copiado; se existir
-    # e causar conflito de admin, removemos o conteúdo de auth e recriamos.
-    deploy_stack_remote "portainer" "portainer.yaml" && echo portainer >> "$deployed_list"
-    info "Aguardando Portainer (25s)..."
-    sleep 25
-    init_portainer_admin || true
-  else
-    warn "portainer.yaml não encontrado — pulando Portainer"
-  fi
+  deploy_one_stack() {
+    local name="$1"
+    local yaml
 
-  # Demais YAMLs: nome da stack = basename sem extensão
-  while IFS= read -r yaml || [ -n "$yaml" ]; do
-    [ -z "$yaml" ] && continue
-    local base name
-    base=$(basename "$yaml")
-    name="${base%.yaml}"
-    name="${name%.yml}"
-    case "$name" in
-      traefik|portainer) continue ;;
-    esac
-    # Só deploy se a stack existia na origem
-    if grep -qx "$name" "$STACKS_FILE" 2>/dev/null; then
-      deploy_stack_remote "$name" "$base" && echo "$name" >> "$deployed_list"
-    else
-      # YAML sem stack correspondente — tenta mesmo assim se nome limpo
-      if remote "test -f /root/$base"; then
-        info "YAML extra $base — tentando deploy como stack $name"
-        deploy_stack_remote "$name" "$base" && echo "$name" >> "$deployed_list" || true
-      fi
+    if grep -qx "$name" "$deployed_list" 2>/dev/null; then
+      return 0
     fi
-  done < "$YAML_LIST"
 
-  # Stacks da origem sem YAML correspondente
+    yaml=$(find_stack_yaml "$name" 2>/dev/null || true)
+    if [ -z "$yaml" ]; then
+      warn "Stack '$name' sem YAML no destino — não redeployada"
+      echo "$name" >> "$failed_list"
+      return 1
+    fi
+
+    deploy_i=$((deploy_i + 1))
+    info "[$deploy_i/$stack_total] Deploy: $name ($yaml)"
+    if deploy_stack_remote "$name" "$yaml"; then
+      echo "$name" >> "$deployed_list"
+      case "$name" in
+        traefik)
+          info "Aguardando Traefik estabilizar (20s)..."
+          sleep 20
+          ;;
+        portainer)
+          info "Aguardando Portainer (25s)..."
+          sleep 25
+          init_portainer_admin || true
+          ;;
+      esac
+      return 0
+    fi
+
+    echo "$name" >> "$failed_list"
+    return 1
+  }
+
+  # Infra primeiro: Traefik → Portainer → bancos → resto (ordem alfabética)
+  local priority=(traefik portainer postgres pgvector)
+  local p
+  for p in "${priority[@]}"; do
+    if grep -qx "$p" "$STACKS_FILE" 2>/dev/null; then
+      deploy_one_stack "$p" || true
+    fi
+  done
+
   while IFS= read -r stack || [ -n "$stack" ]; do
     [ -z "$stack" ] && continue
-    if grep -qx "$stack" "$deployed_list" 2>/dev/null; then
-      continue
-    fi
-    if remote "test -f /root/${stack}.yaml"; then
-      deploy_stack_remote "$stack" "${stack}.yaml" && echo "$stack" >> "$deployed_list"
-    elif remote "test -f /root/${stack}.yml"; then
-      deploy_stack_remote "$stack" "${stack}.yml" && echo "$stack" >> "$deployed_list"
-    elif remote "test -f /root/impa-exported-stacks/${stack}.yaml"; then
-      remote "cp /root/impa-exported-stacks/${stack}.yaml /root/${stack}.yaml"
-      deploy_stack_remote "$stack" "${stack}.yaml" && echo "$stack" >> "$deployed_list"
-    else
-      warn "Stack '$stack' sem YAML em /root nem export Portainer — não redeployada"
-    fi
-  done < "$STACKS_FILE"
+    deploy_one_stack "$stack" || true
+  done < <(sort -u "$STACKS_FILE")
+
+  local deployed failed
+  deployed=$(wc -l < "$deployed_list" | tr -d ' ')
+  failed=$(wc -l < "$failed_list" | tr -d ' ')
+  ok "Stacks deployadas: $deployed/$stack_total"
+  if [ "$failed" -gt 0 ]; then
+    warn "Stacks sem deploy ($failed):"
+    while IFS= read -r s || [ -n "$s" ]; do
+      [ -z "$s" ] && continue
+      echo -e "  ${VERMELHO}- $s${RESET}"
+    done < "$failed_list"
+  fi
 }
 
 init_portainer_admin() {
@@ -1176,13 +1218,31 @@ validate_migration() {
   remote "docker service ls" || warn "Não listou serviços"
 
   echo ""
-  local origin_stacks dest_stacks
+  local origin_stacks dest_stacks missing=0
   origin_stacks=$(wc -l < "$STACKS_FILE" | tr -d ' ')
   dest_stacks=$(remote "docker stack ls --format '{{.Name}}' | wc -l" 2>/dev/null | tr -d ' \r' || echo 0)
   if [ "$dest_stacks" -ge 1 ]; then
     ok "Destino tem $dest_stacks stack(s) (origem tinha $origin_stacks)"
   else
     off "Nenhuma stack no destino"
+  fi
+
+  echo ""
+  echo -e "${BRANCO}Stacks faltando no destino:${RESET}"
+  while IFS= read -r stack || [ -n "$stack" ]; do
+    [ -z "$stack" ] && continue
+    if remote "docker stack ls --format '{{.Name}}' | grep -qx '$stack'"; then
+      echo -e "  ${VERDE}✓${RESET} $stack"
+    else
+      echo -e "  ${VERMELHO}✗${RESET} $stack"
+      missing=$((missing + 1))
+    fi
+  done < "$STACKS_FILE"
+
+  if [ "$missing" -gt 0 ]; then
+    warn "$missing stack(s) ausente(s) — revise o log ou rode deploy manual no destino"
+  else
+    ok "Todas as stacks da origem estão no destino"
   fi
 }
 

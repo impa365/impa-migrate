@@ -1,5 +1,8 @@
 # Secrets — nunca subir
 senhacloud.txt
+vps-test.env
+vps-test.local.env
+credentials/
 *.token
 *.secret
 .env
