@@ -10,13 +10,8 @@ Não é obrigatório ter instalado com nenhuma ferramenta específica. Serve par
 bash <(curl -sSL https://migrator.impa365.com)
 ```
 
-Ou:
-
-```bash
-curl -fsSL https://migrator.impa365.com -o impa-migrator.sh
-chmod +x impa-migrator.sh
-sudo ./impa-migrator.sh
-```
+No navegador, `https://migrator.impa365.com` abre a landing da IMPA (copiar comando).  
+`curl` / `wget` / `/install` continuam servindo o script.
 
 ## O que faz
 
