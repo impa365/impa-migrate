@@ -1,9 +1,11 @@
 #!/bin/bash
-# IMPA Migrator — migração SetupOrion (Swarm + Traefik + Portainer + stacks + volumes)
+# IMPA Migrator — migra Docker Swarm / Portainer / stacks / volumes entre VPS
 # Rode na VPS de ORIGEM: sudo ./impa-migrator.sh
-# Versão: 1.0.0-mvp
+#                          bash <(curl -sSL https://migrator.impa365.com)
 
 set -o pipefail
+
+IMPA_MIGRATOR_VERSION="1.1.0"
 
 # =============================================================================
 # Cores / UI
@@ -25,6 +27,7 @@ NETWORKS_FILE="$STATE_DIR/networks.txt"
 YAML_LIST="$STATE_DIR/yamls.txt"
 EXPORTED_STACKS_DIR="$STATE_DIR/exported_stacks"
 EXPORTED_STACKS_LIST="$STATE_DIR/exported_stacks.txt"
+REPLICAS_FILE="$STATE_DIR/replicas.txt"
 PORTAINER_EXPORT_COUNT=0
 
 DEST_IP=""
@@ -40,6 +43,7 @@ ORIGIN_OS=""
 ORIGIN_VERSION=""
 ORIGIN_ARCH=""
 ORIGIN_SWARM=""
+ORIGIN_MODE=""      # cutover | test
 TOTAL_BYTES=0
 TOTAL_HUMAN="0B"
 ROOT_BYTES=0
@@ -68,7 +72,7 @@ step() { echo -e "\n${AMARELO}▶${RESET} ${BRANCO}$1${RESET}\n"; log "STEP: $1"
 die() {
   off "$1"
   echo ""
-  echo -e "${VERMELHO}Migração abortada. A VPS de origem NÃO foi alterada (ou só foi pausada).${RESET}"
+  echo -e "${VERMELHO}Migração abortada. A VPS de origem NÃO foi destruída.${RESET}"
   echo -e "${BRANCO}Log: ${AMARELO}$LOG_FILE${RESET}"
   exit 1
 }
@@ -98,6 +102,11 @@ human_bytes() {
   }'
 }
 
+show_version() {
+  echo -e " ${BRANCO}Versão do IMPA Migrator: ${VERDE}v. ${IMPA_MIGRATOR_VERSION}${RESET}"
+  echo -e " ${CIANO}https://impa365.com${RESET}  ·  ${CIANO}https://github.com/impa365/impa-migrate${RESET}"
+}
+
 banner() {
   clear 2>/dev/null || true
   echo -e "${AMARELO}===================================================================================================${RESET}"
@@ -109,11 +118,91 @@ banner() {
   echo -e "${AMARELO}=${RESET}  ${BRANCO}██║██║ ╚═╝ ██║██║     ██║  ██║    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║${RESET}${AMARELO}=${RESET}"
   echo -e "${AMARELO}=${RESET}  ${BRANCO}╚═╝╚═╝     ╚═╝╚═╝     ╚═╝  ╚═╝    ╚═╝     ╚═╝╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝${RESET}${AMARELO}=${RESET}"
   echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
-  echo -e "${AMARELO}=${RESET}  ${CIANO}Migração SetupOrion  ·  Swarm + Traefik + Portainer + Stacks + Volumes${RESET}                        ${AMARELO}=${RESET}"
-  echo -e "${AMARELO}=${RESET}  ${BRANCO}v1.0.0-mvp  ·  IMPA 365${RESET}                                                                      ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${CIANO}Migração Docker  ·  Swarm + Portainer + Stacks + Volumes${RESET}                                      ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}v. ${IMPA_MIGRATOR_VERSION}  ·  IMPA 365${RESET}                                                                    ${AMARELO}=${RESET}"
   echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
   echo -e "${AMARELO}===================================================================================================${RESET}"
   echo ""
+  show_version
+  echo ""
+}
+
+direitos_impa() {
+  echo -e "${AMARELO}===================================================================================================${RESET}"
+  echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}Este migrador foi desenvolvido pela IMPA 365 para auxiliar na migração de ambientes Docker${RESET}   ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}(Swarm, Portainer, stacks e volumes) entre VPS — sem clonar o sistema operacional.${RESET}           ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}Você pode usar, copiar, modificar e distribuir. Ao utilizar, mantenha os créditos:${RESET}            ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${CIANO}IMPA 365${RESET} ${BRANCO}—${RESET} ${CIANO}https://impa365.com${RESET}  ${BRANCO}|${RESET}  ${CIANO}https://github.com/impa365/impa-migrate${RESET}                  ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}Não é necessário ter instalado com nenhuma ferramenta específica. Serve para VPS com${RESET}         ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}Docker Swarm (Portainer opcional). Destino deve ser Debian/Ubuntu limpo, mesma arquitetura.${RESET} ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}  ${BRANCO}Você é o responsável pelos seus dados, backups e pelo uso deste software.${RESET}                    ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}=${RESET}                                                                                                 ${AMARELO}=${RESET}"
+  echo -e "${AMARELO}===================================================================================================${RESET}"
+  echo ""
+}
+
+accept_credits() {
+  direitos_impa
+  if ! confirm_yn "Ao digitar Y você aceita e concorda com as orientações acima"; then
+    clear 2>/dev/null || true
+    echo "Que pena que você não concorda. Encerrando o migrador."
+    exit 1
+  fi
+}
+
+# Backup fortemente recomendado — 3 confirmações se recusar
+backup_gate() {
+  step "Backup da VPS de origem"
+  echo -e "${VERMELHO}É ALTAMENTE RECOMENDADO fazer backup completo da VPS de origem antes de migrar.${RESET}"
+  echo -e "${BRANCO}Snapshot na provedora, backup dos volumes ou imagem da VPS.${RESET}"
+  echo ""
+
+  if confirm_yn "Você já fez (ou fará agora) o backup antes de continuar"; then
+    ok "Backup confirmado pelo usuário"
+    log "BACKUP: user confirmed yes"
+    return 0
+  fi
+
+  warn "Você indicou que NÃO tem backup."
+  if ! confirm_yn "Tem certeza que deseja continuar SEM backup"; then
+    die "Faça o backup e execute o migrador novamente."
+  fi
+
+  echo ""
+  echo -e "${VERMELHO}Última confirmação.${RESET}"
+  if ! confirm_yn "Tem CERTEZA absoluta de seguir SEM backup (terceira e última vez)"; then
+    die "Faça o backup e execute o migrador novamente."
+  fi
+
+  echo ""
+  echo -e "${VERMELHO}Ok. Seguindo por sua conta e risco — sem backup confirmado.${RESET}"
+  log "BACKUP: user declined three times — proceeding at own risk"
+  sleep 2
+}
+
+choose_origin_mode() {
+  step "Modo de migração (VPS antiga)"
+  echo -e "${BRANCO}Durante a cópia dos volumes a origem é pausada por alguns minutos (consistência de banco).${RESET}"
+  echo ""
+  echo -e "  ${AMARELO}[1]${RESET} ${BRANCO}Cutover (produção)${RESET}"
+  echo -e "      Origem fica PAUSADA ao final. Ideal quando for apontar o DNS de vez."
+  echo ""
+  echo -e "  ${AMARELO}[2]${RESET} ${BRANCO}Teste (origem continua viva)${RESET}"
+  echo -e "      Após a cópia, a origem é RELIGADA. Você testa a VPS nova,"
+  echo -e "      aponta DNS se quiser e ainda pode voltar o DNS para a antiga."
+  echo ""
+  while true; do
+    read -r -p "$(echo -e "${AMARELO}Escolha [1/2]: ${RESET}")" mode
+    case "$mode" in
+      1) ORIGIN_MODE="cutover"; ok "Modo: cutover (origem permanece pausada)"; break ;;
+      2) ORIGIN_MODE="test"; ok "Modo: teste (origem será religada após a transferência)"; break ;;
+      *) echo -e "${VERMELHO}Digite 1 ou 2.${RESET}" ;;
+    esac
+  done
 }
 
 # =============================================================================
@@ -191,18 +280,18 @@ validate_origin_os() {
 
 require_docker_swarm() {
   if ! command -v docker >/dev/null 2>&1; then
-    die "Docker não encontrado na origem. Ambiente SetupOrion esperado."
+    die "Docker não encontrado na origem. Este migrador precisa de Docker com Swarm."
   fi
   ok "Docker instalado"
 
   ORIGIN_SWARM="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)"
   if [ "$ORIGIN_SWARM" != "active" ]; then
-    die "Docker Swarm não está ativo. Este migrador é SetupOrion-first (Swarm obrigatório)."
+    die "Docker Swarm não está ativo. Por enquanto só migrados ambientes Swarm (stacks). Compose puro: em breve."
   fi
   ok "Docker Swarm ativo"
 
   if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qi 'portainer'; then
-    warn "Container/serviço Portainer não detectado pelo nome — continuando se houver stacks."
+    warn "Portainer não detectado pelo nome — seguindo se houver stacks Swarm."
   else
     ok "Portainer detectado"
   fi
@@ -224,7 +313,7 @@ discovery() {
   local stack_count
   stack_count=$(wc -l < "$STACKS_FILE" | tr -d ' ')
   if [ "$stack_count" -eq 0 ]; then
-    die "Nenhuma stack Swarm encontrada. Ambiente não parece SetupOrion."
+    die "Nenhuma stack Swarm encontrada. Nada para migrar neste modo."
   fi
   ok "$stack_count stack(s) encontrada(s)"
 
@@ -264,7 +353,7 @@ discovery() {
     warn "/root/dados_vps não encontrada"
   fi
 
-  # Tamanho útil de /root (SetupOrion: YAMLs, dados_vps, scripts, etc.)
+  # Tamanho útil de /root (YAMLs, dados_vps, scripts, etc.)
   ROOT_BYTES=$(du -sb /root --exclude=/root/.cache --exclude=/root/.local --exclude=/root/.npm 2>/dev/null | awk '{print $1}')
   ROOT_BYTES=${ROOT_BYTES:-0}
   ROOT_HUMAN=$(human_bytes "$ROOT_BYTES")
@@ -314,8 +403,8 @@ discovery() {
   ok "Tempo estimado: ~${ESTIMATED_MIN} min (depende da rede)"
 }
 
-# Exporta definições de stack via API do Portainer (antes do freeze).
-# Motivo: muitas stacks Orion/Portainer NÃO têm YAML em /root — só no banco do Portainer.
+# Exporta stacks via API do Portainer (antes do freeze).
+# Motivo: muitas stacks NÃO têm YAML em /root — só no banco do Portainer.
 # Não dá para confiar só em portainer_data no destino (Swarm ID muda e a UI fica órfã).
 export_stacks_from_portainer() {
   step "Exportando stacks do Portainer (API)"
@@ -447,7 +536,7 @@ show_inventory() {
   echo -e "  Dados:        ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  YAMLs /root:  ${CIANO}$(wc -l < "$YAML_LIST" | tr -d ' ')${RESET}"
   echo -e "  Export Portainer: ${CIANO}${PORTAINER_EXPORT_COUNT}${RESET} (stacks com compose via API)"
-  echo -e "  Pasta /root:  ${CIANO}${ROOT_HUMAN:-?}${RESET} (YAMLs, dados_vps e demais arquivos Orion)"
+  echo -e "  Pasta /root:  ${CIANO}${ROOT_HUMAN:-?}${RESET} (YAMLs, dados_vps e demais arquivos)"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 }
@@ -586,16 +675,25 @@ show_summary_and_confirm() {
   echo -e "  Redes:    $(wc -l < "$NETWORKS_FILE" | tr -d ' ')"
   echo -e "  YAMLs:    $(wc -l < "$YAML_LIST" | tr -d ' ')"
   echo -e "  Portainer export: ${PORTAINER_EXPORT_COUNT} stack(s)"
-  echo -e "  /root:    ${ROOT_HUMAN:-?} (pasta completa SetupOrion)"
+  echo -e "  /root:    ${ROOT_HUMAN:-?}"
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "  Modo:     ${CIANO}TESTE${RESET} (origem será religada)"
+  else
+    echo -e "  Modo:     ${CIANO}CUTOVER${RESET} (origem permanece pausada)"
+  fi
   echo -e "  Tempo:    ~${ESTIMATED_MIN} min"
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
   echo -e "  1. Instala Docker + Swarm no destino"
   echo -e "  2. Recria redes overlay e volumes"
-  echo -e "  3. Pausa stacks na ORIGEM (dados consistentes)"
+  echo -e "  3. Pausa stacks na ORIGEM (cópia consistente dos bancos)"
   echo -e "  4. Transfere volumes + /root + stacks exportadas do Portainer"
-  echo -e "  5. Sobe Traefik → Portainer → demais stacks (YAML /root + export API)"
-  echo -e "  6. Origem permanece intacta (só pausada)"
+  echo -e "  5. Sobe Traefik → Portainer → demais stacks"
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "  6. RELIGA a origem (você pode testar DNS na nova e voltar)"
+  else
+    echo -e "  6. Origem permanece pausada (intacta para rollback)"
+  fi
   echo -e "  ${AMARELO}Obs:${RESET} portainer_data NÃO é clonado (Swarm ID novo)."
   echo -e "       As stacks vêm do export da API + arquivos em /root."
   echo ""
@@ -673,17 +771,21 @@ REMOTE
 }
 
 # =============================================================================
-# Freeze origem
+# Freeze / unfreeze origem
 # =============================================================================
 freeze_origin() {
   step "Pausando stacks na origem (consistência de dados)"
-  warn "Os serviços ficarão offline até você religá-los ou concluir a migração."
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    warn "Modo TESTE: pausa temporária — a origem será religada depois da cópia."
+  else
+    warn "Modo CUTOVER: a origem ficará pausada ao final (dados intactos)."
+  fi
 
-  # Scale services to 0 where possible; fallback docker service update --replicas 0
+  : > "$REPLICAS_FILE"
+
   while IFS= read -r stack || [ -n "$stack" ]; do
     [ -z "$stack" ] && continue
     info "Pausando stack: $stack"
-    # Lista serviços da stack e replica 0
     local services
     services=$(docker stack services "$stack" --format '{{.Name}}' 2>/dev/null || true)
     if [ -z "$services" ]; then
@@ -692,10 +794,14 @@ freeze_origin() {
     fi
     while IFS= read -r svc || [ -n "$svc" ]; do
       [ -z "$svc" ] && continue
+      local replicas
+      replicas=$(docker service inspect "$svc" --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}1{{end}}' 2>/dev/null || echo 1)
+      replicas=${replicas:-1}
+      echo "${svc} ${replicas}" >> "$REPLICAS_FILE"
       if docker service scale "${svc}=0" >/dev/null 2>&1; then
-        ok "  $svc → 0"
+        ok "  $svc → 0 (era $replicas)"
       else
-        docker service update --replicas 0 "$svc" >/dev/null 2>&1 && ok "  $svc → 0" || off "  Falha ao pausar $svc"
+        docker service update --replicas 0 "$svc" >/dev/null 2>&1 && ok "  $svc → 0 (era $replicas)" || off "  Falha ao pausar $svc"
       fi
     done <<< "$services"
   done < "$STACKS_FILE"
@@ -703,6 +809,38 @@ freeze_origin() {
   info "Aguardando flush de I/O (10s)..."
   sleep 10
   ok "Origem pausada"
+}
+
+unfreeze_origin() {
+  step "Religando stacks na origem (modo teste)"
+  if [ ! -s "$REPLICAS_FILE" ]; then
+    warn "Sem mapa de replicas salvo — tentando scale=1 em todos os serviços das stacks"
+    while IFS= read -r stack || [ -n "$stack" ]; do
+      [ -z "$stack" ] && continue
+      local services
+      services=$(docker stack services "$stack" --format '{{.Name}}' 2>/dev/null || true)
+      while IFS= read -r svc || [ -n "$svc" ]; do
+        [ -z "$svc" ] && continue
+        docker service scale "${svc}=1" >/dev/null 2>&1 && ok "  $svc → 1" || warn "  Falha ao religar $svc"
+      done <<< "$services"
+    done < "$STACKS_FILE"
+    return 0
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    local svc replicas
+    svc=$(echo "$line" | awk '{print $1}')
+    replicas=$(echo "$line" | awk '{print $2}')
+    replicas=${replicas:-1}
+    [ "$replicas" -lt 1 ] 2>/dev/null && replicas=1
+    if docker service scale "${svc}=${replicas}" >/dev/null 2>&1; then
+      ok "  $svc → $replicas"
+    else
+      warn "  Falha ao religar $svc"
+    fi
+  done < "$REPLICAS_FILE"
+  ok "Origem religada — você pode apontar DNS para a nova e voltar se quiser"
 }
 
 # =============================================================================
@@ -754,7 +892,7 @@ transfer_volume() {
 }
 
 transfer_root() {
-  step "Transferindo pasta /root (SetupOrion)"
+  step "Transferindo pasta /root"
   info "Copia YAMLs, dados_vps, scripts e demais arquivos de /root"
   info "Tamanho estimado: $ROOT_HUMAN"
   # Exclui só lixo/cache — mantém .ssh, dados_vps, *.yaml, etc.
@@ -778,7 +916,7 @@ transfer_root() {
         | pv -s "$ROOT_BYTES" \
         | remote "tar -C /root -xf -"; then
         ok "Pasta /root transferida ($ROOT_HUMAN)"
-        # Sanity checks típicos do Orion
+        # Sanity checks
         remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
         local yaml_dest
         yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
@@ -996,27 +1134,32 @@ validate_migration() {
 final_report() {
   step "Migração concluída"
   echo -e "${AMARELO}===================================================================================================${RESET}"
-  echo -e "${VERDE}  IMPA Migrator — relatório final${RESET}"
+  echo -e "${VERDE}  IMPA Migrator v. ${IMPA_MIGRATOR_VERSION} — relatório final${RESET}"
   echo -e "${AMARELO}===================================================================================================${RESET}"
   echo ""
   echo -e "  Destino:     ${CIANO}${DEST_USER}@${DEST_IP}${RESET}"
   echo -e "  Dados:       ${CIANO}$TOTAL_HUMAN${RESET}"
+  echo -e "  Modo:        ${CIANO}${ORIGIN_MODE}${RESET}"
   if [ -n "$PORTAINER_URL" ]; then
     echo -e "  Portainer:   ${CIANO}https://${PORTAINER_URL#https://}${RESET}"
     echo -e "  Usuário:     ${CIANO}$PORTAINER_USER${RESET}"
   fi
   echo ""
-  echo -e "  ${AMARELO}PRÓXIMOS PASSOS OBRIGATÓRIOS:${RESET}"
+  echo -e "  ${AMARELO}PRÓXIMOS PASSOS:${RESET}"
   echo -e "  1. Apontar os registros DNS A dos seus domínios para ${VERDE}${DEST_IP}${RESET}"
   echo -e "  2. Aguardar propagação DNS e testar Traefik/Portainer/apps"
-  echo -e "  3. Só então desligar/cancelar a VPS antiga"
-  echo ""
-  echo -e "  ${BRANCO}A origem está PAUSADA (replicas=0), mas intacta.${RESET}"
-  echo -e "  ${BRANCO}Para religar a origem (rollback):${RESET}"
-  echo -e "    ${CIANO}# em cada serviço: docker service scale NOME=1${RESET}"
-  echo -e "    ${CIANO}# ou: docker stack deploy -c /root/STACK.yaml STACK${RESET}"
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "  3. A origem está ${VERDE}LIGADA${RESET} de novo — pode voltar o DNS se precisar"
+    echo -e "  4. Só cancele a VPS antiga quando tiver certeza da nova"
+  else
+    echo -e "  3. A origem está ${AMARELO}PAUSADA${RESET} (intacta). Só desligue/cancele quando validar a nova"
+    echo -e "  4. Rollback (religar origem):"
+    echo -e "       ${CIANO}docker service scale NOME=1${RESET}"
+    echo -e "       ${CIANO}# ou: docker stack deploy -c /root/STACK.yaml STACK${RESET}"
+  fi
   echo ""
   echo -e "  Log completo: ${AMARELO}$LOG_FILE${RESET}"
+  echo -e "  Créditos: ${CIANO}IMPA 365${RESET} — https://impa365.com"
   if [ "$FAILED_STEPS" -gt 0 ]; then
     echo -e "  ${VERMELHO}Atenção: $FAILED_STEPS passo(s) com falha — revise o log.${RESET}"
   fi
@@ -1029,15 +1172,22 @@ final_report() {
 main() {
   mkdir -p "$STATE_DIR"
   : > "$LOG_FILE"
-  log "=== IMPA Migrator start ==="
+  log "=== IMPA Migrator v.${IMPA_MIGRATOR_VERSION} start ==="
 
   banner
-  echo -e "${BRANCO}Este migrador reconstrói um ambiente SetupOrion (Docker Swarm) em uma VPS nova.${RESET}"
-  echo -e "${BRANCO}Não clona o sistema operacional. Destino deve estar limpo.${RESET}"
+  accept_credits
+  clear 2>/dev/null || true
+  banner
+
+  echo -e "${BRANCO}Migra ambientes Docker Swarm (Portainer/stacks/volumes) para uma VPS nova e limpa.${RESET}"
+  echo -e "${BRANCO}Não exige instalador específico. Não clona o sistema operacional.${RESET}"
   echo ""
-  if ! confirm_yn "Você leu e aceita os requisitos (Debian/Ubuntu, destino limpo, mesma arch)"; then
+  if ! confirm_yn "Requisitos OK (Debian/Ubuntu, destino limpo, mesma arch)"; then
     die "Aceite necessário para continuar."
   fi
+
+  backup_gate
+  choose_origin_mode
 
   require_root
   validate_origin_os
@@ -1058,9 +1208,14 @@ main() {
   transfer_all
   restore_stacks
   validate_migration
+
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    unfreeze_origin
+  fi
+
   final_report
 
-  log "=== IMPA Migrator end ==="
+  log "=== IMPA Migrator v.${IMPA_MIGRATOR_VERSION} end ==="
 }
 
 main "$@"

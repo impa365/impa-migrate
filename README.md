@@ -1,34 +1,33 @@
 # IMPA Migrator
 
-One-liner interativo para migrar ambientes **SetupOrion** (Docker Swarm + Traefik + Portainer + stacks + volumes) de uma VPS para outra — sem clonar o sistema operacional.
+**v. 1.1.0** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
 
-Estilo SetupOrion: Bash puro, wizard no terminal, zero painel/SaaS.
+Desenvolvido pela **IMPA 365**. Ao usar, mantenha os créditos: [impa365.com](https://impa365.com) · [github.com/impa365/impa-migrate](https://github.com/impa365/impa-migrate)
+
+Não é obrigatório ter instalado com nenhuma ferramenta específica. Serve para **qualquer VPS com Docker Swarm** (Portainer opcional).
 
 ```bash
+bash <(curl -sSL https://migrator.impa365.com)
+```
+
+Ou:
+
+```bash
+curl -fsSL https://migrator.impa365.com -o impa-migrator.sh
+chmod +x impa-migrator.sh
 sudo ./impa-migrator.sh
 ```
 
-One-liner futuro (quando hospedado):
+## O que faz
 
-```bash
-bash <(curl -sSL migrator.impa365.com)
-```
-
-## O que este migrador faz
-
-Roda na **VPS de origem** e:
-
-1. Detecta SO, arquitetura, Swarm, stacks, redes overlay, volumes e a pasta `/root`
-2. Conecta na VPS nova via SSH e valida que está limpa
-3. Instala Docker + inicia Swarm no destino
-4. Recria redes overlay e volumes com os mesmos nomes
-5. Pausa as stacks na origem (consistência de Postgres/dados)
-6. Transfere volumes (`_data`) e o **conteúdo de `/root`** (YAMLs, `dados_vps`, scripts, `.ssh`, etc.)
-7. Faz `docker stack deploy` (Traefik → Portainer → demais)
-8. Tenta recriar o admin do Portainer (Swarm ID muda; não reutiliza stacks órfãs do volume antigo)
-9. Gera relatório + instrução de DNS
-
-A origem **não é apagada** — só fica com replicas em 0.
+1. Créditos IMPA + versão no banner  
+2. **Backup altamente recomendado** (confirmação em até 3 etapas)  
+3. Modo **cutover** (origem fica pausada) ou **teste** (origem é religada)  
+4. Discovery: OS, Swarm, stacks, volumes, `/root`, export de stacks via API do Portainer  
+5. Preflight no destino (limpo, mesma arch, espaço)  
+6. Provision Docker + Swarm  
+7. Pausa origem → copia volumes + `/root` → sobe stacks  
+8. No modo teste, religa a origem automaticamente  
 
 ## Requisitos
 
@@ -37,111 +36,49 @@ A origem **não é apagada** — só fica com replicas em 0.
 | Item | Valor |
 |------|--------|
 | SO | Debian 11/12/13 ou Ubuntu 22.04+ |
-| Ambiente | Docker Swarm ativo (SetupOrion) |
+| Ambiente | Docker **Swarm** ativo (Portainer opcional) |
 | Acesso | root |
-| Artefatos | Pasta `/root` completa (YAMLs, `dados_vps`, scripts Orion) |
 
-### Destino (obrigatório: VPS limpa)
+### Destino (VPS limpa)
 
 | Item | Valor |
 |------|--------|
 | SO | Debian 11/12/13 ou Ubuntu 22.04+ |
-| Estado | **Sem Docker**, sem containers |
-| Arch | **Igual** à origem (`x86_64` ↔ `x86_64`) |
-| Espaço | Dados da origem + margem (~15% + 5 GB) |
+| Estado | **Sem Docker** |
+| Arch | Igual à origem |
 | SSH | Chave ou senha (`sshpass` se senha) |
 
-> **Greenfield:** se o destino já tiver Docker, o script **aborta**. Isso corta 90% do suporte.
+## Modos
 
-## Fluxo (wizard)
+| Modo | Origem ao final | Quando usar |
+|------|-----------------|-------------|
+| **1 · Cutover** | Pausada | Troca definitiva de DNS |
+| **2 · Teste** | Religada | Testar a nova VPS e poder voltar o DNS |
 
-```
-Banner + aceite (Y/N)
-        ↓
-Discovery na origem (stacks, volumes, GB)
-        ↓
-IP / usuário / SSH do destino
-        ↓
-Preflight (limpo? arch? espaço?)
-        ↓
-Resumo + digite MIGRAR
-        ↓
-Provision → Freeze → Transfer → Restore → Validate
-        ↓
-Relatório + apontar DNS
-```
+Nos dois casos a origem **nunca é apagada**. No teste ela só fica offline o tempo da cópia dos volumes (consistência de banco).
 
-Log: `/var/log/impa-migrator.log`
+## Backup
 
-## Pasta /root (SetupOrion)
+O wizard pergunta se você já fez backup. Se disser não, confirma mais duas vezes e só então segue **por sua conta e risco**.
 
-O migrador copia **quase toda** a pasta `/root` da origem para o destino, porque o SetupOrion guarda lá:
+## Stacks sem YAML em `/root`
 
-- `*.yaml` / `*.yml` das stacks  
-- `dados_vps/` (credenciais, rede interna, e-mail SSL, Portainer)  
-- scripts e arquivos auxiliares  
-- `.ssh` (chaves), se existirem  
+O migrador exporta stacks pela **API do Portainer** (quando há credenciais) e faz `docker stack deploy` no destino. O volume `portainer_data` não é clonado (Swarm ID muda).
 
-**Excluídos** (lixo/cache): `.cache`, `.local`, `.npm`, cache do Composer.
+## DNS
 
-## Stacks que só existem no Portainer
+1. Aponte os A records para o IP novo  
+2. Teste  
+3. No modo teste, pode apontar de volta para a antiga  
+4. Só cancele a VPS antiga quando tiver certeza  
 
-Nem toda stack tem YAML em `/root`. Muitas ficam só no banco do Portainer.
+## Log
 
-Por isso o migrador, **ainda na origem e antes de pausar tudo**:
+`/var/log/impa-migrator.log`
 
-1. Autentica na API do Portainer (`dados_vps/dados_portainer`)
-2. Lista as stacks e baixa o compose de cada uma (`/api/stacks/{id}/file`)
-3. Guarda em `/root/impa-exported-stacks/` no destino e faz `docker stack deploy`
+## Fora do escopo (por enquanto)
 
-O volume `portainer_data` **não é clonado**: o Swarm ID muda e a UI ficaria órfã. As stacks sobem de novo pelos YAMLs (`/root` + export da API) e o admin do Portainer é recriado.
-
-## Depois da migração — DNS
-
-Os domínios (Portainer, n8n, Evolution, etc.) ainda apontam para o IP antigo.
-
-1. Altere os registros **DNS A** para o IP da VPS nova  
-2. Aguarde a propagação  
-3. Teste Traefik / Portainer / apps  
-4. Só então cancele a VPS antiga  
-
-Certificados Let's Encrypt (`volume_swarm_certificates`) são copiados para reduzir atrito no cutover; o desafio ACME pode exigir DNS já no IP novo.
-
-## Rollback
-
-Origem pausada, dados intactos. Para religar:
-
-```bash
-# por serviço
-docker service scale NOME_DO_SERVICO=1
-
-# ou redeploy da stack
-docker stack deploy -c /root/STACK.yaml STACK
-```
-
-## O que NÃO está no MVP
-
-- Clonar o SO inteiro (`rsync`/`dd` de `/`)
-- Painel web / SaaS / login no navegador
-- Ambientes só Docker Compose (sem Swarm) — detectados e abortados
-- Troca de arquitetura (x86 → ARM)
-- Recriar stacks pela API do Portainer (usa YAML + `docker stack deploy`)
-
-## Teste recomendado
-
-1ª rodada: Hostinger (origem Orion) → HostG (Debian/Ubuntu limpo).  
-**Não** use VPS de cliente na primeira validação.
-
-## Estrutura
-
-```
-vps/
-├── impa-migrator.sh   # motor único
-└── README.md
-```
-
-## Avisos
-
-- Digite `MIGRAR` só depois de conferir o resumo.
-- Tags `latest` em bancos podem quebrar no pull do destino; stacks Orion com versão fixa (`postgres:14`) são o cenário ideal.
-- Se o `admin/init` do Portainer falhar, é comum enquanto o DNS ainda aponta para a origem — conclua o DNS e acesse o Portainer no destino.
+- Clonar o SO inteiro  
+- Painel web / SaaS  
+- Docker Compose sem Swarm  
+- Troca de arquitetura (x86 → ARM)  
