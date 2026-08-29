@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.1"
+IMPA_MIGRATOR_VERSION="1.1.2"
 
 # =============================================================================
 # Cores / UI
@@ -206,21 +206,70 @@ choose_origin_mode() {
 }
 
 # =============================================================================
-# SSH helpers
+# Dependências na origem (estilo SetupOrion — só o que faltar)
 # =============================================================================
-ensure_sshpass() {
-  command -v sshpass >/dev/null 2>&1 && return 0
+# pacote apt → binário esperado (vazio = só pacote)
+ORIGIN_DEPS=(
+  "curl:curl"
+  "jq:jq"
+  "sshpass:sshpass"
+  "tar:tar"
+  "ca-certificates:"
+  "openssh-client:ssh"
+  "pv:pv"
+)
 
-  info "Instalando sshpass (necessário para autenticação por senha)..."
-  apt-get update -qq >/dev/null 2>&1 || true
-  if apt-get install -y -qq sshpass >/dev/null 2>&1; then
-    ok "sshpass instalado"
+install_origin_deps() {
+  step "Dependências na VPS de origem"
+  echo -e "${BRANCO}Instala só o que ainda não existir (curl, jq, sshpass, tar, pv…).${RESET}"
+  echo ""
+
+  local missing=()
+  local pkg bin
+  for entry in "${ORIGIN_DEPS[@]}"; do
+    pkg="${entry%%:*}"
+    bin="${entry#*:}"
+    if [ -n "$bin" ]; then
+      if command -v "$bin" >/dev/null 2>&1; then
+        ok "$bin já instalado"
+      else
+        missing+=("$pkg")
+        info "Falta: $pkg"
+      fi
+    else
+      if dpkg -s "$pkg" >/dev/null 2>&1; then
+        ok "$pkg já instalado"
+      else
+        missing+=("$pkg")
+        info "Falta: $pkg"
+      fi
+    fi
+  done
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    ok "Todas as dependências já estão presentes"
     return 0
   fi
 
-  die "Não foi possível instalar sshpass. Rode: apt-get install -y sshpass  (ou use autenticação por chave SSH)"
+  info "Instalando: ${missing[*]}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null 2>&1 || true
+  if ! apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1; then
+    die "Falha ao instalar dependências: ${missing[*]}. Rode: apt-get install -y ${missing[*]}"
+  fi
+
+  # Obrigatórios — pv é opcional (só barra de progresso)
+  local required_bins=(curl jq sshpass tar ssh)
+  for bin in "${required_bins[@]}"; do
+    command -v "$bin" >/dev/null 2>&1 || die "Binário obrigatório ausente após install: $bin"
+  done
+
+  ok "Dependências instaladas"
 }
 
+# =============================================================================
+# SSH helpers
+# =============================================================================
 build_ssh() {
   SSH_BASE=(ssh "${SSH_OPTS[@]}")
   SCP_BASE=(scp "${SSH_OPTS[@]}")
@@ -228,7 +277,7 @@ build_ssh() {
     SSH_BASE+=(-i "$DEST_SSH_KEY")
     SCP_BASE+=(-i "$DEST_SSH_KEY")
   elif [ "$DEST_AUTH_MODE" = "password" ]; then
-    ensure_sshpass
+    command -v sshpass >/dev/null 2>&1 || die "sshpass ausente (deveria ter sido instalado no início)."
     export SSHPASS="$DEST_PASSWORD"
     SSH_BASE=(sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
     SCP_BASE=(sshpass -e scp "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
@@ -423,11 +472,6 @@ export_stacks_from_portainer() {
   : > "$EXPORTED_STACKS_LIST"
   PORTAINER_EXPORT_COUNT=0
 
-  if ! command -v jq >/dev/null 2>&1; then
-    info "Instalando jq (necessário para exportar stacks)..."
-    apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq jq >/dev/null 2>&1 || true
-  fi
   if ! command -v jq >/dev/null 2>&1; then
     warn "jq indisponível — não foi possível exportar stacks do Portainer."
     warn "Stacks sem YAML em /root podem NÃO migrar."
@@ -1202,6 +1246,7 @@ main() {
 
   require_root
   validate_origin_os
+  install_origin_deps
   require_docker_swarm
   discovery
   show_inventory

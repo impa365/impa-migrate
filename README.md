@@ -1,6 +1,6 @@
 # IMPA Migrator
 
-**v. 1.1.1** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
+**v. 1.1.2** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
 
 Desenvolvido pela **IMPA 365**. Ao usar, mantenha os créditos: [impa365.com](https://impa365.com) · [github.com/impa365/impa-migrate](https://github.com/impa365/impa-migrate)
 
@@ -33,6 +33,7 @@ No navegador, `https://migrator.impa365.com` abre a landing da IMPA (copiar coma
 | SO | Debian 11/12/13 ou Ubuntu 22.04+ |
 | Ambiente | Docker **Swarm** ativo (Portainer opcional) |
 | Acesso | root |
+| Deps | Instaladas no início se faltarem (`curl`, `jq`, `sshpass`, `tar`, `pv`…) |
 
 ### Destino (VPS limpa)
 
