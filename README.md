@@ -59,7 +59,7 @@ O wizard pergunta se você já fez backup. Se disser não, confirma mais duas ve
 
 ## Stacks sem YAML em `/root`
 
-O migrador exporta stacks pela **API do Portainer** (quando há credenciais) e faz `docker stack deploy` no destino. O volume `portainer_data` **não** é clonado (Swarm ID novo deixa a UI órfã), mas o **admin é recriado automaticamente** com usuário/senha de `dados_portainer` — você entra com o mesmo login, sem setup manual.
+O migrador exporta stacks **ativas** pela API do Portainer (quando há credenciais) e no destino recria **somente essas** pela mesma API (`/api/stacks/create/swarm/file`), como o SetupOrion. Se a stack existe no Portainer **e** em `/root`, **vale o compose do Portainer** (edições na UI nem sempre refletem no arquivo). YAMLs extras em `/root` são copiados, mas **não são ativados** no Portainer automaticamente. Traefik e Portainer sobem via `docker stack deploy` (podem aparecer como *Limited*, e isso é normal).
 
 O `traefik.yaml` é ajustado no destino para **v3.6.1+** (Docker 29 quebra Traefik 3.5).
 
@@ -69,7 +69,7 @@ O `traefik.yaml` é ajustado no destino para **v3.6.1+** (Docker 29 quebra Traef
 2. `/root` (YAMLs + `dados_vps`)  
 3. **Traefik → Portainer → admin** (`dados_portainer`)  
 4. Freeze na origem + transferência dos volumes  
-5. **Demais stacks** (com Portainer já inicializado — evita status *Limited*)
+5. **Demais stacks** — só as **ativas no Portainer da origem**, via API (estilo SetupOrion)
 
 ## DNS
 

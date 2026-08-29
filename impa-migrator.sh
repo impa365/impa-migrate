@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.5"
+IMPA_MIGRATOR_VERSION="1.1.9"
 
 # =============================================================================
 # Cores / UI
@@ -27,8 +27,10 @@ NETWORKS_FILE="$STATE_DIR/networks.txt"
 YAML_LIST="$STATE_DIR/yamls.txt"
 EXPORTED_STACKS_DIR="$STATE_DIR/exported_stacks"
 EXPORTED_STACKS_LIST="$STATE_DIR/exported_stacks.txt"
+PORTAINER_DEPLOY_FILE="$STATE_DIR/portainer_deploy.txt"
 REPLICAS_FILE="$STATE_DIR/replicas.txt"
 PORTAINER_EXPORT_COUNT=0
+PORTAINER_DEPLOY_COUNT=0
 
 DEST_IP=""
 DEST_USER="root"
@@ -52,6 +54,7 @@ ESTIMATED_MIN=0
 PORTAINER_URL=""
 PORTAINER_USER=""
 PORTAINER_PASS=""
+PORTAINER_DEST_DOMAIN=""
 FAILED_STEPS=0
 
 # =============================================================================
@@ -414,9 +417,14 @@ discovery() {
       PORTAINER_USER=$(grep -oP '(?<=Usuario: ).*' /root/dados_vps/dados_portainer 2>/dev/null | head -1 || true)
       PORTAINER_PASS=$(grep -oP '(?<=Senha: ).*' /root/dados_vps/dados_portainer 2>/dev/null | head -1 || true)
       [ -n "$PORTAINER_URL" ] && ok "Credenciais Portainer lidas ($PORTAINER_URL)"
+    elif grep -qx portainer "$STACKS_FILE" 2>/dev/null; then
+      warn "dados_portainer ausente — recomendamos SetupOrion; você definirá usuário/senha na migração"
     fi
   else
     warn "/root/dados_vps não encontrada"
+    if grep -qx portainer "$STACKS_FILE" 2>/dev/null; then
+      warn "Sem SetupOrion/dados_vps — você definirá o admin do Portainer durante a migração"
+    fi
   fi
 
   # Tamanho útil de /root (YAMLs, dados_vps, scripts, etc.)
@@ -425,8 +433,20 @@ discovery() {
   ROOT_HUMAN=$(human_bytes "$ROOT_BYTES")
   ok "Conteúdo de /root a migrar: $ROOT_HUMAN"
 
-  # Exporta stacks do Portainer (fonte da verdade quando NÃO há YAML em /root)
-  export_stacks_from_portainer
+  # Lista do Portainer = fonte da verdade do que ATIVAR no destino (YAML em /root só copia)
+  if grep -qx portainer "$STACKS_FILE" 2>/dev/null; then
+    export_stacks_from_portainer || die "Não foi possível listar stacks ativas do Portainer (obrigatório)."
+    build_portainer_deploy_list
+  else
+    warn "Stack portainer ausente no Swarm — modo legado: ativa todas as stacks Swarm."
+    : > "$PORTAINER_DEPLOY_FILE"
+    while IFS= read -r s || [ -n "$s" ]; do
+      [ -z "$s" ] && continue
+      case "$s" in traefik|portainer) continue ;; esac
+      echo "$s" >> "$PORTAINER_DEPLOY_FILE"
+    done < "$STACKS_FILE"
+    PORTAINER_DEPLOY_COUNT=$(wc -l < "$PORTAINER_DEPLOY_FILE" | tr -d ' ')
+  fi
 
   # Tamanho dos volumes
   TOTAL_BYTES=0
@@ -460,6 +480,7 @@ discovery() {
     echo "VOLUMES=$vol_count"
     echo "YAMLS=$yaml_count"
     echo "EXPORTED_PORTAINER=$PORTAINER_EXPORT_COUNT"
+    echo "PORTAINER_DEPLOY=$PORTAINER_DEPLOY_COUNT"
     echo "TOTAL_BYTES=$TOTAL_BYTES"
     echo "TOTAL_HUMAN=$TOTAL_HUMAN"
   } > "$INVENTORY"
@@ -469,25 +490,19 @@ discovery() {
   ok "Tempo estimado: ~${ESTIMATED_MIN} min (depende da rede)"
 }
 
-# Exporta stacks via API do Portainer (antes do freeze).
-# Motivo: muitas stacks NÃO têm YAML em /root — só no banco do Portainer.
-# Não dá para confiar só em portainer_data no destino (Swarm ID muda e a UI fica órfã).
+# Exporta stacks ATIVAS do Portainer (Status=1). YAML em /root é copiado, mas só isso ativa no destino.
 export_stacks_from_portainer() {
-  step "Exportando stacks do Portainer (API)"
+  step "Stacks ativas no Portainer (fonte da verdade para deploy)"
   mkdir -p "$EXPORTED_STACKS_DIR"
   : > "$EXPORTED_STACKS_LIST"
   PORTAINER_EXPORT_COUNT=0
 
   if ! command -v jq >/dev/null 2>&1; then
-    warn "jq indisponível — não foi possível exportar stacks do Portainer."
-    warn "Stacks sem YAML em /root podem NÃO migrar."
-    return 1
+    die "jq obrigatório para listar stacks do Portainer."
   fi
 
   if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
-    warn "Sem usuário/senha do Portainer em dados_vps — pulando export API."
-    warn "Se alguma stack só existir no Portainer (sem /root/*.yaml), ela pode faltar no destino."
-    return 1
+    die "Credenciais do Portainer ausentes — necessárias para saber quais stacks ativar."
   fi
 
   local bases=()
@@ -515,28 +530,32 @@ export_stacks_from_portainer() {
   done
 
   if [ -z "$token" ]; then
-    warn "Não autenticou no Portainer — export API falhou."
-    warn "Stacks só no Portainer (sem YAML em /root) podem faltar. Confira dados_portainer."
-    return 1
+    die "Não autenticou no Portainer — confira dados_portainer."
   fi
 
   local stacks_json
   stacks_json=$(curl -k -s --connect-timeout 10 -H "Authorization: Bearer $token" "$base/api/stacks" 2>/dev/null || true)
   if [ -z "$stacks_json" ] || ! echo "$stacks_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    warn "Resposta inválida de /api/stacks"
-    return 1
+    die "Resposta inválida de /api/stacks no Portainer."
   fi
 
-  local count
+  local count active_count
   count=$(echo "$stacks_json" | jq 'length')
-  info "Portainer reportou $count stack(s) — baixando compose..."
+  active_count=$(echo "$stacks_json" | jq '[.[] | select(.Status == 1)] | length')
+  info "Portainer: $count stack(s) cadastrada(s), $active_count ativa(s) — exportando ativas..."
 
-  local i id name file_json content outfile
+  local i id name status file_json content outfile
   for i in $(seq 0 $((count - 1))); do
     id=$(echo "$stacks_json" | jq -r ".[$i].Id")
     name=$(echo "$stacks_json" | jq -r ".[$i].Name")
+    status=$(echo "$stacks_json" | jq -r ".[$i].Status // 0")
     [ -z "$id" ] || [ "$id" = "null" ] && continue
     [ -z "$name" ] || [ "$name" = "null" ] && continue
+
+    if [ "$status" != "1" ]; then
+      info "  Pulando $name (inativa no Portainer, Status=$status)"
+      continue
+    fi
 
     file_json=$(curl -k -s --connect-timeout 15 -H "Authorization: Bearer $token" \
       "$base/api/stacks/${id}/file" 2>/dev/null || true)
@@ -557,24 +576,44 @@ export_stacks_from_portainer() {
     echo "$name" >> "$EXPORTED_STACKS_LIST"
     PORTAINER_EXPORT_COUNT=$((PORTAINER_EXPORT_COUNT + 1))
 
-    # Garante que a stack aparece no inventário Swarm mesmo se docker stack ls falhar no nome
-    if ! grep -qx "$name" "$STACKS_FILE" 2>/dev/null; then
-      echo "$name" >> "$STACKS_FILE"
-    fi
-
     if [ -f "/root/${name}.yaml" ] || [ -f "/root/${name}.yml" ]; then
-      ok "  $name (Portainer + já tinha em /root)"
+      ok "  $name (ativa no Portainer — compose da API tem prioridade sobre /root)"
     else
-      ok "  $name (só no Portainer → exportado)"
+      ok "  $name (ativa no Portainer — compose exportado)"
     fi
   done
 
   if [ "$PORTAINER_EXPORT_COUNT" -eq 0 ]; then
-    warn "Nenhuma stack exportada do Portainer."
-    return 1
+    warn "Nenhuma stack ativa no Portainer (só traefik/portainer ou ambiente vazio)."
+  else
+    ok "$PORTAINER_EXPORT_COUNT stack(s) ativa(s) no Portainer — compose salvo para o destino"
   fi
-  ok "$PORTAINER_EXPORT_COUNT definição(ões) de stack salva(s) para o destino"
   return 0
+}
+
+# Apps a ativar no destino = ativas no Portainer, exceto traefik/portainer (infra via docker CLI).
+build_portainer_deploy_list() {
+  : > "$PORTAINER_DEPLOY_FILE"
+  while IFS= read -r name || [ -n "$name" ]; do
+    [ -z "$name" ] && continue
+    case "$name" in
+      traefik|portainer) continue ;;
+    esac
+    echo "$name" >> "$PORTAINER_DEPLOY_FILE"
+  done < "$EXPORTED_STACKS_LIST"
+
+  PORTAINER_DEPLOY_COUNT=$(wc -l < "$PORTAINER_DEPLOY_FILE" | tr -d ' ')
+  ok "$PORTAINER_DEPLOY_COUNT app(s) serão ativadas no Portainer do destino"
+
+  local swarm_n yaml_n
+  swarm_n=$(wc -l < "$STACKS_FILE" | tr -d ' ')
+  if [ "$swarm_n" -gt "$((PORTAINER_DEPLOY_COUNT + 2))" ]; then
+    info "Swarm rodava $swarm_n stacks — só as ativas no Portainer serão ativadas no destino"
+  fi
+  yaml_n=$(wc -l < "$YAML_LIST" | tr -d ' ')
+  if [ "$yaml_n" -gt "$PORTAINER_DEPLOY_COUNT" ]; then
+    info "$yaml_n YAML(s) em /root serão copiados (extras não são ativados automaticamente)"
+  fi
 }
 
 show_inventory() {
@@ -583,11 +622,18 @@ show_inventory() {
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo -e "  SO:           ${CIANO}$ORIGIN_OS $ORIGIN_VERSION${RESET} ($ORIGIN_ARCH)"
   echo -e "  Swarm:        ${CIANO}$ORIGIN_SWARM${RESET}"
-  echo -e "  Stacks:       ${CIANO}$(wc -l < "$STACKS_FILE" | tr -d ' ')${RESET}"
+  echo -e "  Stacks Swarm: ${CIANO}$(wc -l < "$STACKS_FILE" | tr -d ' ')${RESET} (rodando na origem)"
   while IFS= read -r s || [ -n "$s" ]; do
     [ -z "$s" ] && continue
     echo -e "                - $s"
   done < "$STACKS_FILE"
+  echo -e "  Ativar no Portainer: ${CIANO}${PORTAINER_DEPLOY_COUNT:-0}${RESET}"
+  if [ -f "$PORTAINER_DEPLOY_FILE" ] && [ -s "$PORTAINER_DEPLOY_FILE" ]; then
+    while IFS= read -r s || [ -n "$s" ]; do
+      [ -z "$s" ] && continue
+      echo -e "                - $s"
+    done < "$PORTAINER_DEPLOY_FILE"
+  fi
   echo -e "  Redes:        ${CIANO}$(wc -l < "$NETWORKS_FILE" | tr -d ' ')${RESET}"
   while IFS= read -r n || [ -n "$n" ]; do
     [ -z "$n" ] && continue
@@ -596,7 +642,7 @@ show_inventory() {
   echo -e "  Volumes:      ${CIANO}$(wc -l < "$VOLUMES_FILE" | tr -d ' ')${RESET}"
   echo -e "  Dados:        ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  YAMLs /root:  ${CIANO}$(wc -l < "$YAML_LIST" | tr -d ' ')${RESET}"
-  echo -e "  Export Portainer: ${CIANO}${PORTAINER_EXPORT_COUNT}${RESET} (stacks com compose via API)"
+  echo -e "  Export Portainer: ${CIANO}${PORTAINER_EXPORT_COUNT}${RESET} ativa(s) (compose via API)"
   echo -e "  Pasta /root:  ${CIANO}${ROOT_HUMAN:-?}${RESET} (YAMLs, dados_vps e demais arquivos)"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
@@ -731,11 +777,12 @@ show_summary_and_confirm() {
   echo -e "  ${BRANCO}ORIGEM${RESET}  →  esta VPS ($ORIGIN_OS $ORIGIN_VERSION / $ORIGIN_ARCH)"
   echo -e "  ${BRANCO}DESTINO${RESET} →  ${CIANO}${DEST_USER}@${DEST_IP}${RESET}"
   echo ""
-  echo -e "  Stacks:   $(wc -l < "$STACKS_FILE" | tr -d ' ')"
+  echo -e "  Stacks Swarm: $(wc -l < "$STACKS_FILE" | tr -d ' ')"
+  echo -e "  Ativar Portainer: ${PORTAINER_DEPLOY_COUNT:-0} app(s)"
   echo -e "  Volumes:  $(wc -l < "$VOLUMES_FILE" | tr -d ' ')  ($TOTAL_HUMAN)"
   echo -e "  Redes:    $(wc -l < "$NETWORKS_FILE" | tr -d ' ')"
-  echo -e "  YAMLs:    $(wc -l < "$YAML_LIST" | tr -d ' ')"
-  echo -e "  Portainer export: ${PORTAINER_EXPORT_COUNT} stack(s)"
+  echo -e "  YAMLs /root: $(wc -l < "$YAML_LIST" | tr -d ' ') (copiados; extras não ativam)"
+  echo -e "  Portainer ativas: ${PORTAINER_EXPORT_COUNT} stack(s)"
   echo -e "  /root:    ${ROOT_HUMAN:-?}"
   if [ "$ORIGIN_MODE" = "test" ]; then
     echo -e "  Modo:     ${CIANO}TESTE${RESET} (origem será religada)"
@@ -748,14 +795,15 @@ show_summary_and_confirm() {
   echo -e "  1. Instala Docker + Swarm no destino"
   echo -e "  2. Envia YAMLs/dados_vps e sobe Traefik → Portainer → admin"
   echo -e "  3. Pausa origem e transfere volumes (consistência de banco)"
-  echo -e "  4. Sobe demais stacks (com Portainer já inicializado — sem Limited)"
+  echo -e "  4. Ativa no Portainer só as stacks que estavam ativas na origem (YAML extra em /root só copia)"
   if [ "$ORIGIN_MODE" = "test" ]; then
     echo -e "  6. RELIGA a origem (você pode testar DNS na nova e voltar)"
   else
     echo -e "  6. Origem permanece pausada (intacta para rollback)"
   fi
   echo -e "  ${AMARELO}Obs:${RESET} portainer_data NÃO é clonado (Swarm ID novo)."
-  echo -e "       O admin é recriado com as credenciais de dados_portainer (mesmo login)."
+  echo -e "       Traefik/Portainer sobem via docker stack deploy (podem ficar Limited — normal)."
+  echo -e "       Demais stacks sobem via API do Portainer (controle total, como SetupOrion)."
   echo ""
   echo -e "  ${VERMELHO}Após a migração, aponte o DNS A dos domínios para ${DEST_IP}${RESET}"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
@@ -779,7 +827,7 @@ provision_destination() {
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates gnupg lsb-release tar >/dev/null
+apt-get install -y -qq curl ca-certificates gnupg lsb-release tar jq >/dev/null
 if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
@@ -923,7 +971,7 @@ transfer_volume() {
   # Clonar portainer_data deixa a UI órfã. As stacks sobem pelo export da API + YAMLs.
   if [ "$vol" = "portainer_data" ]; then
     warn "Pulando conteúdo de portainer_data (Swarm ID muda)"
-    warn "Stacks: export Portainer API (${PORTAINER_EXPORT_COUNT}) + YAMLs em /root"
+    warn "Compose: ${PORTAINER_EXPORT_COUNT} ativa(s) no Portainer + YAMLs em /root (só ativas são deployadas)"
     return 0
   fi
 
@@ -1018,14 +1066,13 @@ transfer_all() {
     echo -e "${AMARELO}[$i/$total]${RESET}"
     transfer_volume "$vol" || true
   done < "$VOLUMES_FILE"
-
-  transfer_exported_stacks || true
 }
 
 transfer_root_preflight() {
   step "Enviando /root para o destino (YAMLs + dados_vps)"
   echo -e "${BRANCO}Antes do freeze — só configuração, para subir Traefik/Portainer.${RESET}"
   transfer_root || die "Falha ao enviar /root para o destino."
+  transfer_exported_stacks || die "Falha ao enviar compose do Portainer (prioridade sobre /root)."
 }
 
 transfer_exported_stacks() {
@@ -1048,16 +1095,18 @@ transfer_exported_stacks() {
   local name
   while IFS= read -r name || [ -n "$name" ]; do
     [ -z "$name" ] && continue
-    if ! remote "test -f /root/${name}.yaml -o -f /root/${name}.yml"; then
-      if remote "test -f /root/impa-exported-stacks/${name}.yaml"; then
+    if remote "test -f /root/impa-exported-stacks/${name}.yaml"; then
+      if remote "test -f /root/${name}.yaml -o -f /root/${name}.yml"; then
+        remote "cp /root/impa-exported-stacks/${name}.yaml /root/${name}.yaml" \
+          && ok "  $name → Portainer sobrescreve /root (compose mais recente)" \
+          || off "  Falha ao priorizar Portainer para $name"
+      else
         remote "cp /root/impa-exported-stacks/${name}.yaml /root/${name}.yaml" \
           && ok "  $name → /root/${name}.yaml (veio do Portainer)" \
           || off "  Falha ao copiar $name para /root"
-      else
-        warn "  $name exportado mas YAML ausente no destino"
       fi
     else
-      ok "  $name (backup em impa-exported-stacks; /root já tinha YAML)"
+      warn "  $name exportado mas YAML ausente em impa-exported-stacks"
     fi
   done < "$EXPORTED_STACKS_LIST"
 }
@@ -1130,27 +1179,146 @@ deploy_stack_remote() {
   local file="$2"
   remote "test -f /root/$file" || { off "YAML ausente no destino: $file"; return 1; }
   if remote "docker stack deploy --prune --resolve-image always -c /root/$file $name"; then
-    ok "Stack deploy: $name"
+    ok "Stack deploy (CLI): $name"
     return 0
   fi
   off "Falha deploy: $name"
   return 1
 }
 
+portainer_dest_domain() {
+  local domain="${PORTAINER_URL#https://}"
+  domain="${domain#http://}"
+  domain="${domain%/}"
+  if [ -z "$domain" ]; then
+    domain=$(remote "grep -oE 'Host\\(\\\`[^\\\`]+\\\`\\)' /root/portainer.yaml 2>/dev/null | head -1 | sed -E 's/Host\\(\\\`([^\\\`]+)\\\`\\)/\\1/'" 2>/dev/null | tr -d '\r' || true)
+  fi
+  [ -z "$domain" ] && domain="portainer.local"
+  PORTAINER_DEST_DOMAIN="$domain"
+}
+
+# SetupOrion: apps via API do Portainer (controle total). Só traefik/portainer usam docker stack deploy.
+init_portainer_dest_api() {
+  step "Portainer API no destino (deploy estilo SetupOrion)"
+  command -v jq >/dev/null 2>&1 || die "jq necessário na origem."
+
+  if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
+    die "Credenciais Portainer ausentes — necessárias para deploy via API."
+  fi
+
+  remote "command -v jq >/dev/null 2>&1 || apt-get install -y -qq jq >/dev/null" \
+    || die "Não foi possível instalar jq no destino."
+
+  portainer_dest_domain
+  info "Domínio Portainer (Host header): $PORTAINER_DEST_DOMAIN"
+
+  local user_b64 pass_b64 result
+  user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
+  pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
+
+  result=$(remote "DOMAIN='$PORTAINER_DEST_DOMAIN' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE'
+set -euo pipefail
+USER=$(echo "$USER_B64" | base64 -d)
+PASS=$(echo "$PASS_B64" | base64 -d)
+TOKEN=""
+for _ in $(seq 1 12); do
+  TOKEN=$(curl -sk -X POST -H "Content-Type: application/json" -H "Host: $DOMAIN" \
+    -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" \
+    https://127.0.0.1/api/auth 2>/dev/null | jq -r '.jwt // empty')
+  [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && break
+  sleep 5
+done
+[ -z "$TOKEN" ] && { echo "AUTH_FAIL"; exit 1; }
+
+ENDPOINT_ID=$(curl -sk -H "Authorization: Bearer $TOKEN" -H "Host: $DOMAIN" \
+  https://127.0.0.1/api/endpoints 2>/dev/null \
+  | jq -r '.[] | select(.Name == "primary") | .Id')
+SWARM_ID=$(curl -sk -H "Authorization: Bearer $TOKEN" -H "Host: $DOMAIN" \
+  "https://127.0.0.1/api/endpoints/${ENDPOINT_ID}/docker/swarm" 2>/dev/null | jq -r '.ID')
+
+TOKEN_B64=$(printf '%s' "$TOKEN" | base64 -w0 2>/dev/null || printf '%s' "$TOKEN" | base64)
+cat > /tmp/impa-portainer-api.env <<ENVEOF
+DOMAIN=$DOMAIN
+TOKEN_B64=$TOKEN_B64
+ENDPOINT_ID=$ENDPOINT_ID
+SWARM_ID=$SWARM_ID
+ENVEOF
+chmod 600 /tmp/impa-portainer-api.env
+echo "OK|$ENDPOINT_ID|$SWARM_ID"
+REMOTE
+) || die "Falha ao conectar na API do Portainer no destino."
+
+  if [[ "$result" != OK* ]]; then
+    die "Portainer API no destino: $result"
+  fi
+  ok "Portainer API pronta (endpoint $(echo "$result" | cut -d'|' -f2), swarm $(echo "$result" | cut -d'|' -f3 | cut -c1-12)…)"
+}
+
+deploy_stack_via_portainer() {
+  local name="$1"
+  local file="$2"
+  remote "test -f /root/$file" || { off "YAML ausente no destino: $file"; return 1; }
+
+  local out rc=0
+  out=$(remote "NAME='$name' YAML='/root/$file' bash -s" <<'REMOTE' 2>&1) || rc=$?
+set -euo pipefail
+source /tmp/impa-portainer-api.env
+TOKEN=$(echo "$TOKEN_B64" | base64 -d)
+
+STACK_ID=$(curl -sk -H "Authorization: Bearer $TOKEN" -H "Host: $DOMAIN" \
+  https://127.0.0.1/api/stacks 2>/dev/null \
+  | jq -r --arg n "$NAME" '.[] | select(.Name == $n) | .Id' | head -1)
+if [ -n "$STACK_ID" ] && [ "$STACK_ID" != "null" ]; then
+  curl -sk -X DELETE -H "Authorization: Bearer $TOKEN" -H "Host: $DOMAIN" \
+    "https://127.0.0.1/api/stacks/${STACK_ID}?external=true&endpointId=${ENDPOINT_ID}" >/dev/null 2>&1 || true
+  sleep 3
+fi
+
+if docker stack ls --format '{{.Name}}' 2>/dev/null | grep -qx "$NAME"; then
+  docker stack rm "$NAME" >/dev/null 2>&1 || true
+  sleep 10
+fi
+
+http_code=$(curl -sk -o /tmp/impa_stack_resp.json -w "%{http_code}" -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Host: $DOMAIN" \
+  -F "Name=$NAME" \
+  -F "file=@$YAML" \
+  -F "SwarmID=$SWARM_ID" \
+  -F "endpointId=$ENDPOINT_ID" \
+  https://127.0.0.1/api/stacks/create/swarm/file)
+
+if [ "$http_code" = "200" ] && grep -q '"Id"' /tmp/impa_stack_resp.json 2>/dev/null; then
+  echo "OK"
+  exit 0
+fi
+echo "HTTP_$http_code"
+cat /tmp/impa_stack_resp.json 2>/dev/null || true
+exit 1
+REMOTE
+
+  if [ "$rc" -eq 0 ] && echo "$out" | grep -qx "OK"; then
+    ok "Stack via Portainer API: $name"
+    return 0
+  fi
+  off "Falha deploy Portainer API: $name"
+  [ -n "$out" ] && warn "$(echo "$out" | tail -3)"
+  return 1
+}
+
 find_stack_yaml() {
   local stack="$1"
+  # Portainer API = fonte da verdade (edições na UI nem sempre vão para /root)
+  if remote "test -f /root/impa-exported-stacks/${stack}.yaml"; then
+    echo "impa-exported-stacks/${stack}.yaml"
+    return 0
+  fi
   if remote "test -f /root/${stack}.yaml"; then
     echo "${stack}.yaml"
     return 0
   fi
   if remote "test -f /root/${stack}.yml"; then
     echo "${stack}.yml"
-    return 0
-  fi
-  if remote "test -f /root/impa-exported-stacks/${stack}.yaml"; then
-    remote "cp /root/impa-exported-stacks/${stack}.yaml /root/${stack}.yaml" \
-      || return 1
-    echo "${stack}.yaml"
     return 0
   fi
   return 1
@@ -1160,12 +1328,14 @@ restore_stacks() {
   deploy_application_stacks
 }
 
-# SetupOrion: Docker → Traefik → Portainer → admin ANTES das demais stacks.
-# Stacks deployadas antes do admin ficam "Limited" no Portainer.
+# Traefik/Portainer: docker stack deploy (Limited no Portainer é esperado).
+# Apps: API do Portainer — igual SetupOrion stack_editavel /api/stacks/create/swarm/file
 bootstrap_dest_infra() {
   step "Bootstrap no destino (estilo SetupOrion)"
-  echo -e "${BRANCO}Traefik → Portainer → admin (dados_portainer) → depois as outras stacks.${RESET}"
+  echo -e "${BRANCO}Traefik → Portainer → admin (docker CLI). Apps depois via API Portainer.${RESET}"
   echo ""
+
+  ensure_portainer_credentials
 
   patch_traefik_for_modern_docker || true
 
@@ -1190,12 +1360,12 @@ bootstrap_dest_infra() {
       deploy_stack_remote "portainer" "$yaml" || die "Falha ao subir Portainer no destino."
       info "Aguardando Portainer (25s)..."
       sleep 25
-      init_portainer_admin || die "Admin Portainer não criado — abortando (stacks ficariam Limited)."
+      init_portainer_admin || die "Admin Portainer não criado — necessário para deploy via API."
     else
       die "portainer.yaml ausente no destino."
     fi
   else
-    warn "Stack portainer não encontrada — demais stacks podem ficar Limited."
+    warn "Stack portainer não encontrada — deploy via API das demais stacks não será possível."
   fi
 
   ok "Infra pronta — Portainer inicializado"
@@ -1203,8 +1373,15 @@ bootstrap_dest_infra() {
 
 deploy_application_stacks() {
   step "Restaurando stacks de aplicação no destino"
-  echo -e "${BRANCO}Só após admin Portainer existir (evita stacks Limited).${RESET}"
+  echo -e "${BRANCO}Só stacks ativas no Portainer da origem — via API (SetupOrion).${RESET}"
   echo ""
+
+  if [ ! -s "$PORTAINER_DEPLOY_FILE" ]; then
+    warn "Nenhuma app para ativar no Portainer — pulando deploy de aplicações."
+    return 0
+  fi
+
+  init_portainer_dest_api
 
   local deployed_list="$STATE_DIR/deployed.txt"
   local failed_list="$STATE_DIR/deploy_failed.txt"
@@ -1214,7 +1391,7 @@ deploy_application_stacks() {
   grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && echo "portainer" >> "$deployed_list"
 
   local stack_total deploy_i
-  stack_total=$(wc -l < "$STACKS_FILE" | tr -d ' ')
+  stack_total=$(wc -l < "$PORTAINER_DEPLOY_FILE" | tr -d ' ')
   deploy_i=0
 
   deploy_one_stack() {
@@ -1237,8 +1414,8 @@ deploy_application_stacks() {
     fi
 
     deploy_i=$((deploy_i + 1))
-    info "[$deploy_i] Deploy: $name ($yaml)"
-    if deploy_stack_remote "$name" "$yaml"; then
+    info "[$deploy_i] Deploy via Portainer API: $name ($yaml)"
+    if deploy_stack_via_portainer "$name" "$yaml"; then
       echo "$name" >> "$deployed_list"
       return 0
     fi
@@ -1250,18 +1427,20 @@ deploy_application_stacks() {
   local priority=(postgres pgvector)
   local p
   for p in "${priority[@]}"; do
-    grep -qx "$p" "$STACKS_FILE" 2>/dev/null && deploy_one_stack "$p" || true
+    grep -qx "$p" "$PORTAINER_DEPLOY_FILE" 2>/dev/null && deploy_one_stack "$p" || true
   done
 
   while IFS= read -r stack || [ -n "$stack" ]; do
     [ -z "$stack" ] && continue
     deploy_one_stack "$stack" || true
-  done < <(sort -u "$STACKS_FILE")
+  done < <(sort -u "$PORTAINER_DEPLOY_FILE")
 
   local deployed failed
   deployed=$(wc -l < "$deployed_list" | tr -d ' ')
   failed=$(wc -l < "$failed_list" | tr -d ' ')
-  ok "Stacks deployadas: $deployed/$stack_total"
+  local apps_done
+  apps_done=$(grep -vxE 'traefik|portainer' "$deployed_list" 2>/dev/null | grep -c . || true)
+  ok "Apps ativadas no Portainer: $apps_done/$stack_total" 
   if [ "$failed" -gt 0 ]; then
     warn "Stacks sem deploy ($failed):"
     while IFS= read -r s || [ -n "$s" ]; do
@@ -1271,10 +1450,50 @@ deploy_application_stacks() {
   fi
 }
 
+ensure_portainer_credentials() {
+  grep -qx "portainer" "$STACKS_FILE" 2>/dev/null || return 0
+
+  if [ -n "$PORTAINER_USER" ] && [ -n "$PORTAINER_PASS" ]; then
+    ok "Credenciais Portainer: $PORTAINER_USER (dados_vps)"
+    return 0
+  fi
+
+  step "Credenciais do Portainer"
+  echo -e "${BRANCO}Não encontramos dados_portainer em /root/dados_vps.${RESET}"
+  echo -e "${BRANCO}Com SetupOrion isso vem automático — em outras instalações você define aqui.${RESET}"
+  echo ""
+
+  local user="" pass="" pass2=""
+  while [ -z "$user" ]; do
+    read -r -p "$(echo -e "${AMARELO}Usuário admin do Portainer [admin]: ${RESET}")" user
+    user="${user:-admin}"
+  done
+
+  while true; do
+    read -r -s -p "$(echo -e "${AMARELO}Senha (mín. 12 caracteres): ${RESET}")" pass
+    echo ""
+    read -r -s -p "$(echo -e "${AMARELO}Confirme a senha: ${RESET}")" pass2
+    echo ""
+    if [ "$pass" != "$pass2" ]; then
+      warn "Senhas não coincidem — tente de novo."
+      continue
+    fi
+    if [ "${#pass}" -lt 12 ]; then
+      warn "Portainer exige senha com pelo menos 12 caracteres."
+      continue
+    fi
+    break
+  done
+
+  PORTAINER_USER="$user"
+  PORTAINER_PASS="$pass"
+  ok "Credenciais definidas para criar o admin no destino"
+}
+
 init_portainer_admin() {
-  step "Recriando admin do Portainer (mesmo login de dados_vps)"
+  step "Recriando admin do Portainer no destino"
   if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
-    warn "Sem credenciais em dados_portainer — crie o admin manualmente no Portainer novo."
+    warn "Sem credenciais — crie o admin manualmente no Portainer novo."
     return 1
   fi
 
@@ -1305,12 +1524,12 @@ init_portainer_admin() {
     fi
 
     if echo "$response" | grep -q '"Username"'; then
-      ok "Admin Portainer criado: $PORTAINER_USER (mesma senha de dados_portainer)"
+      ok "Admin Portainer criado: $PORTAINER_USER"
       info "Você não precisa do setup token — já entrou com o login antigo."
       return 0
     fi
     if echo "$response" | grep -qiE 'already|exists|initialized'; then
-      ok "Admin Portainer já existe — use $PORTAINER_USER (dados_portainer)"
+      ok "Admin Portainer já existe — use $PORTAINER_USER"
       return 0
     fi
 
@@ -1319,7 +1538,7 @@ init_portainer_admin() {
   done
 
   warn "Não foi possível criar o admin automaticamente."
-  warn "Crie manualmente com o MESMO usuário/senha de dados_portainer"
+  warn "Crie manualmente com o usuário/senha definidos nesta migração"
   warn "ou use o setup_token nos logs: docker service logs portainer_portainer"
   return 1
 }
@@ -1338,17 +1557,23 @@ validate_migration() {
   remote "docker service ls" || warn "Não listou serviços"
 
   echo ""
-  local origin_stacks dest_stacks missing=0
-  origin_stacks=$(wc -l < "$STACKS_FILE" | tr -d ' ')
+  local expected dest_stacks missing=0
+  expected=0
+  grep -qx "traefik" "$STACKS_FILE" 2>/dev/null && expected=$((expected + 1))
+  grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && expected=$((expected + 1))
+  if [ -f "$PORTAINER_DEPLOY_FILE" ]; then
+    expected=$((expected + $(wc -l < "$PORTAINER_DEPLOY_FILE" | tr -d ' ')))
+  fi
   dest_stacks=$(remote "docker stack ls --format '{{.Name}}' | wc -l" 2>/dev/null | tr -d ' \r' || echo 0)
   if [ "$dest_stacks" -ge 1 ]; then
-    ok "Destino tem $dest_stacks stack(s) (origem tinha $origin_stacks)"
+    ok "Destino tem $dest_stacks stack(s) (esperado ~$expected)"
   else
     off "Nenhuma stack no destino"
   fi
 
   echo ""
-  echo -e "${BRANCO}Stacks faltando no destino:${RESET}"
+  echo -e "${BRANCO}Stacks esperadas no destino:${RESET}"
+  missing=0
   while IFS= read -r stack || [ -n "$stack" ]; do
     [ -z "$stack" ] && continue
     if remote "docker stack ls --format '{{.Name}}' | grep -qx '$stack'"; then
@@ -1357,12 +1582,18 @@ validate_migration() {
       echo -e "  ${VERMELHO}✗${RESET} $stack"
       missing=$((missing + 1))
     fi
-  done < "$STACKS_FILE"
+  done < <(
+    {
+      grep -qx "traefik" "$STACKS_FILE" 2>/dev/null && echo "traefik"
+      grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && echo "portainer"
+      [ -f "$PORTAINER_DEPLOY_FILE" ] && cat "$PORTAINER_DEPLOY_FILE"
+    } | sort -u
+  )
 
   if [ "$missing" -gt 0 ]; then
-    warn "$missing stack(s) ausente(s) — revise o log ou rode deploy manual no destino"
+    warn "$missing stack(s) ausente(s) — revise o log"
   else
-    ok "Todas as stacks da origem estão no destino"
+    ok "Todas as stacks esperadas estão no destino"
   fi
 }
 
@@ -1415,7 +1646,7 @@ main() {
   banner
 
   echo -e "${BRANCO}Migra ambientes Docker Swarm (Portainer/stacks/volumes) para uma VPS nova e limpa.${RESET}"
-  echo -e "${BRANCO}Não exige instalador específico. Não clona o sistema operacional.${RESET}"
+  echo -e "${BRANCO}SetupOrion recomendado (credenciais automáticas). Não clona o sistema operacional.${RESET}"
   echo ""
   if ! confirm_yn "Requisitos OK (Debian/Ubuntu, destino limpo, mesma arch)"; then
     die "Aceite necessário para continuar."

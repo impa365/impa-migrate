@@ -7,7 +7,7 @@
 const SCRIPT_URL =
   "https://raw.githubusercontent.com/impa365/impa-migrate/main/impa-migrator.sh";
 
-const VERSION = "1.1.5";
+const VERSION = "1.1.9";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
 
 function wantsScript(request, pathname) {
@@ -376,7 +376,8 @@ function landingPage() {
       <div class="faq">
         <details>
           <summary>Precisa ter instalado com SetupOrion?</summary>
-          <p>Não. Qualquer VPS com Docker Swarm (Portainer opcional) serve. Não exigimos instalador específico.</p>
+          <p>Não é obrigatório, mas <strong>recomendamos muito</strong> o SetupOrion: ele guarda usuário, senha e domínio do Portainer em <code>/root/dados_vps</code>, e o migrador recria o mesmo login na VPS nova automaticamente.</p>
+          <p>Em outras instalações essas informações nem sempre existem — nesse caso o migrador pede que você defina usuário e senha do admin do Portainer antes de subir as stacks.</p>
         </details>
         <details>
           <summary>A VPS de destino pode ter Docker?</summary>
