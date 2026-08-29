@@ -2,6 +2,8 @@
 senhacloud.txt
 vps-test.env
 vps-test.local.env
+vps origem.txt
+vps destino.txt
 credentials/
 *.token
 *.secret
