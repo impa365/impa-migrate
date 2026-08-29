@@ -18,12 +18,12 @@ bash <(curl -sSL migrator.impa365.com)
 
 Roda na **VPS de origem** e:
 
-1. Detecta SO, arquitetura, Swarm, stacks, redes overlay, volumes e YAMLs em `/root`
+1. Detecta SO, arquitetura, Swarm, stacks, redes overlay, volumes e a pasta `/root`
 2. Conecta na VPS nova via SSH e valida que está limpa
 3. Instala Docker + inicia Swarm no destino
 4. Recria redes overlay e volumes com os mesmos nomes
 5. Pausa as stacks na origem (consistência de Postgres/dados)
-6. Transfere volumes (`_data`), YAMLs e `/root/dados_vps`
+6. Transfere volumes (`_data`) e o **conteúdo de `/root`** (YAMLs, `dados_vps`, scripts, `.ssh`, etc.)
 7. Faz `docker stack deploy` (Traefik → Portainer → demais)
 8. Tenta recriar o admin do Portainer (Swarm ID muda; não reutiliza stacks órfãs do volume antigo)
 9. Gera relatório + instrução de DNS
@@ -39,7 +39,7 @@ A origem **não é apagada** — só fica com replicas em 0.
 | SO | Debian 11/12/13 ou Ubuntu 22.04+ |
 | Ambiente | Docker Swarm ativo (SetupOrion) |
 | Acesso | root |
-| Artefatos | `/root/*.yaml` e idealmente `/root/dados_vps/` |
+| Artefatos | Pasta `/root` completa (YAMLs, `dados_vps`, scripts Orion) |
 
 ### Destino (obrigatório: VPS limpa)
 
@@ -72,6 +72,17 @@ Relatório + apontar DNS
 ```
 
 Log: `/var/log/impa-migrator.log`
+
+## Pasta /root (SetupOrion)
+
+O migrador copia **quase toda** a pasta `/root` da origem para o destino, porque o SetupOrion guarda lá:
+
+- `*.yaml` / `*.yml` das stacks  
+- `dados_vps/` (credenciais, rede interna, e-mail SSL, Portainer)  
+- scripts e arquivos auxiliares  
+- `.ssh` (chaves), se existirem  
+
+**Excluídos** (lixo/cache): `.cache`, `.local`, `.npm`, cache do Composer.
 
 ## Depois da migração — DNS
 

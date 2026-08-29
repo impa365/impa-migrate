@@ -1,0 +1,10 @@
+# Secrets — nunca subir
+senhacloud.txt
+*.token
+*.secret
+.env
+.env.*
+cloudflare*.txt
+*token*.txt
+*senha*
+*password*

@@ -39,6 +39,8 @@ ORIGIN_ARCH=""
 ORIGIN_SWARM=""
 TOTAL_BYTES=0
 TOTAL_HUMAN="0B"
+ROOT_BYTES=0
+ROOT_HUMAN="0B"
 ESTIMATED_MIN=0
 PORTAINER_URL=""
 PORTAINER_USER=""
@@ -259,6 +261,12 @@ discovery() {
     warn "/root/dados_vps não encontrada"
   fi
 
+  # Tamanho útil de /root (SetupOrion: YAMLs, dados_vps, scripts, etc.)
+  ROOT_BYTES=$(du -sb /root --exclude=/root/.cache --exclude=/root/.local --exclude=/root/.npm 2>/dev/null | awk '{print $1}')
+  ROOT_BYTES=${ROOT_BYTES:-0}
+  ROOT_HUMAN=$(human_bytes "$ROOT_BYTES")
+  ok "Conteúdo de /root a migrar: $ROOT_HUMAN"
+
   # Tamanho dos volumes
   TOTAL_BYTES=0
   : > "$STATE_DIR/volume_sizes.txt"
@@ -318,6 +326,7 @@ show_inventory() {
   echo -e "  Volumes:      ${CIANO}$(wc -l < "$VOLUMES_FILE" | tr -d ' ')${RESET}"
   echo -e "  Dados:        ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  YAMLs /root:  ${CIANO}$(wc -l < "$YAML_LIST" | tr -d ' ')${RESET}"
+  echo -e "  Pasta /root:  ${CIANO}${ROOT_HUMAN:-?}${RESET} (YAMLs, dados_vps e demais arquivos Orion)"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 }
@@ -434,8 +443,8 @@ REMOTE
   fi
   ok "VPS limpa (sem Docker)"
 
-  # margem 15%
-  local needed=$(( TOTAL_BYTES + TOTAL_BYTES / 7 + 5 * 1024 * 1024 * 1024 ))
+  # margem 15% + root + 5GB
+  local needed=$(( TOTAL_BYTES + ROOT_BYTES + (TOTAL_BYTES + ROOT_BYTES) / 7 + 5 * 1024 * 1024 * 1024 ))
   if [ -n "$dest_free" ] && [ "$dest_free" -lt "$needed" ] 2>/dev/null; then
     die "Espaço insuficiente no destino. Livre=$(human_bytes "$dest_free") Necessário≈$(human_bytes "$needed")"
   fi
@@ -455,13 +464,14 @@ show_summary_and_confirm() {
   echo -e "  Volumes:  $(wc -l < "$VOLUMES_FILE" | tr -d ' ')  ($TOTAL_HUMAN)"
   echo -e "  Redes:    $(wc -l < "$NETWORKS_FILE" | tr -d ' ')"
   echo -e "  YAMLs:    $(wc -l < "$YAML_LIST" | tr -d ' ')"
+  echo -e "  /root:    ${ROOT_HUMAN:-?} (pasta completa SetupOrion)"
   echo -e "  Tempo:    ~${ESTIMATED_MIN} min"
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
   echo -e "  1. Instala Docker + Swarm no destino"
   echo -e "  2. Recria redes overlay e volumes"
   echo -e "  3. Pausa stacks na ORIGEM (dados consistentes)"
-  echo -e "  4. Transfere volumes + YAMLs + dados_vps"
+  echo -e "  4. Transfere volumes + pasta /root (YAMLs, dados_vps, etc.)"
   echo -e "  5. Sobe Traefik → Portainer → demais stacks"
   echo -e "  6. Origem permanece intacta (só pausada)"
   echo ""
@@ -611,6 +621,57 @@ transfer_volume() {
   return 1
 }
 
+transfer_root() {
+  step "Transferindo pasta /root (SetupOrion)"
+  info "Copia YAMLs, dados_vps, scripts e demais arquivos de /root"
+  info "Tamanho estimado: $ROOT_HUMAN"
+  # Exclui só lixo/cache — mantém .ssh, dados_vps, *.yaml, etc.
+  local excludes=(
+    --exclude='./.cache'
+    --exclude='./.local'
+    --exclude='./.npm'
+    --exclude='./.composer/cache'
+    --exclude='./.wget-hsts'
+    --exclude='./.viminfo'
+    --exclude='./.lesshst'
+  )
+
+  remote "mkdir -p /root"
+
+  local attempt=1
+  local max=3
+  while [ "$attempt" -le "$max" ]; do
+    if command -v pv >/dev/null 2>&1 && [ "${ROOT_BYTES:-0}" -gt 0 ]; then
+      if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
+        | pv -s "$ROOT_BYTES" \
+        | remote "tar -C /root -xf -"; then
+        ok "Pasta /root transferida ($ROOT_HUMAN)"
+        # Sanity checks típicos do Orion
+        remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
+        local yaml_dest
+        yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
+        ok "YAMLs no destino: $yaml_dest"
+        return 0
+      fi
+    else
+      if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
+        | remote "tar -C /root -xf -"; then
+        ok "Pasta /root transferida ($ROOT_HUMAN)"
+        remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
+        local yaml_dest
+        yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
+        ok "YAMLs no destino: $yaml_dest"
+        return 0
+      fi
+    fi
+    warn "Tentativa $attempt/$max falhou ao copiar /root — retry em 5s"
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  off "Falha ao transferir pasta /root"
+  return 1
+}
+
 transfer_all() {
   step "Transferindo volumes"
   local i=0
@@ -623,28 +684,7 @@ transfer_all() {
     transfer_volume "$vol" || true
   done < "$VOLUMES_FILE"
 
-  step "Transferindo YAMLs e dados_vps"
-  remote "mkdir -p /root /root/dados_vps"
-
-  if [ -s "$YAML_LIST" ]; then
-    while IFS= read -r yaml || [ -n "$yaml" ]; do
-      [ -z "$yaml" ] && continue
-      [ -f "$yaml" ] || continue
-      if "${SCP_BASE[@]}" "$yaml" "${DEST_USER}@${DEST_IP}:/root/$(basename "$yaml")"; then
-        ok "YAML: $(basename "$yaml")"
-      else
-        off "Falha YAML: $yaml"
-      fi
-    done < "$YAML_LIST"
-  fi
-
-  if [ -d /root/dados_vps ]; then
-    if tar -C /root -cf - dados_vps | remote "tar -C /root -xf -"; then
-      ok "dados_vps copiado"
-    else
-      off "Falha ao copiar dados_vps"
-    fi
-  fi
+  transfer_root || true
 }
 
 # =============================================================================
