@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.0"
+IMPA_MIGRATOR_VERSION="1.1.1"
 
 # =============================================================================
 # Cores / UI
@@ -208,6 +208,19 @@ choose_origin_mode() {
 # =============================================================================
 # SSH helpers
 # =============================================================================
+ensure_sshpass() {
+  command -v sshpass >/dev/null 2>&1 && return 0
+
+  info "Instalando sshpass (necessário para autenticação por senha)..."
+  apt-get update -qq >/dev/null 2>&1 || true
+  if apt-get install -y -qq sshpass >/dev/null 2>&1; then
+    ok "sshpass instalado"
+    return 0
+  fi
+
+  die "Não foi possível instalar sshpass. Rode: apt-get install -y sshpass  (ou use autenticação por chave SSH)"
+}
+
 build_ssh() {
   SSH_BASE=(ssh "${SSH_OPTS[@]}")
   SCP_BASE=(scp "${SSH_OPTS[@]}")
@@ -215,9 +228,7 @@ build_ssh() {
     SSH_BASE+=(-i "$DEST_SSH_KEY")
     SCP_BASE+=(-i "$DEST_SSH_KEY")
   elif [ "$DEST_AUTH_MODE" = "password" ]; then
-    if ! command -v sshpass >/dev/null 2>&1; then
-      die "sshpass não encontrado. Instale: apt-get install -y sshpass  (ou use autenticação por chave SSH)"
-    fi
+    ensure_sshpass
     export SSHPASS="$DEST_PASSWORD"
     SSH_BASE=(sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
     SCP_BASE=(sshpass -e scp "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)

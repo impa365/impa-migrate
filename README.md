@@ -1,6 +1,6 @@
 # IMPA Migrator
 
-**v. 1.1.0** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
+**v. 1.1.1** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
 
 Desenvolvido pela **IMPA 365**. Ao usar, mantenha os créditos: [impa365.com](https://impa365.com) · [github.com/impa365/impa-migrate](https://github.com/impa365/impa-migrate)
 
