@@ -84,6 +84,18 @@ O migrador copia **quase toda** a pasta `/root` da origem para o destino, porque
 
 **Excluídos** (lixo/cache): `.cache`, `.local`, `.npm`, cache do Composer.
 
+## Stacks que só existem no Portainer
+
+Nem toda stack tem YAML em `/root`. Muitas ficam só no banco do Portainer.
+
+Por isso o migrador, **ainda na origem e antes de pausar tudo**:
+
+1. Autentica na API do Portainer (`dados_vps/dados_portainer`)
+2. Lista as stacks e baixa o compose de cada uma (`/api/stacks/{id}/file`)
+3. Guarda em `/root/impa-exported-stacks/` no destino e faz `docker stack deploy`
+
+O volume `portainer_data` **não é clonado**: o Swarm ID muda e a UI ficaria órfã. As stacks sobem de novo pelos YAMLs (`/root` + export da API) e o admin do Portainer é recriado.
+
 ## Depois da migração — DNS
 
 Os domínios (Portainer, n8n, Evolution, etc.) ainda apontam para o IP antigo.

@@ -23,6 +23,9 @@ STACKS_FILE="$STATE_DIR/stacks.txt"
 VOLUMES_FILE="$STATE_DIR/volumes.txt"
 NETWORKS_FILE="$STATE_DIR/networks.txt"
 YAML_LIST="$STATE_DIR/yamls.txt"
+EXPORTED_STACKS_DIR="$STATE_DIR/exported_stacks"
+EXPORTED_STACKS_LIST="$STATE_DIR/exported_stacks.txt"
+PORTAINER_EXPORT_COUNT=0
 
 DEST_IP=""
 DEST_USER="root"
@@ -267,6 +270,9 @@ discovery() {
   ROOT_HUMAN=$(human_bytes "$ROOT_BYTES")
   ok "Conteúdo de /root a migrar: $ROOT_HUMAN"
 
+  # Exporta stacks do Portainer (fonte da verdade quando NÃO há YAML em /root)
+  export_stacks_from_portainer
+
   # Tamanho dos volumes
   TOTAL_BYTES=0
   : > "$STATE_DIR/volume_sizes.txt"
@@ -298,6 +304,7 @@ discovery() {
     echo "NETWORKS=$net_count"
     echo "VOLUMES=$vol_count"
     echo "YAMLS=$yaml_count"
+    echo "EXPORTED_PORTAINER=$PORTAINER_EXPORT_COUNT"
     echo "TOTAL_BYTES=$TOTAL_BYTES"
     echo "TOTAL_HUMAN=$TOTAL_HUMAN"
   } > "$INVENTORY"
@@ -305,6 +312,119 @@ discovery() {
   echo ""
   ok "Dados totais: $TOTAL_HUMAN"
   ok "Tempo estimado: ~${ESTIMATED_MIN} min (depende da rede)"
+}
+
+# Exporta definições de stack via API do Portainer (antes do freeze).
+# Motivo: muitas stacks Orion/Portainer NÃO têm YAML em /root — só no banco do Portainer.
+# Não dá para confiar só em portainer_data no destino (Swarm ID muda e a UI fica órfã).
+export_stacks_from_portainer() {
+  step "Exportando stacks do Portainer (API)"
+  mkdir -p "$EXPORTED_STACKS_DIR"
+  : > "$EXPORTED_STACKS_LIST"
+  PORTAINER_EXPORT_COUNT=0
+
+  if ! command -v jq >/dev/null 2>&1; then
+    info "Instalando jq (necessário para exportar stacks)..."
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y -qq jq >/dev/null 2>&1 || true
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq indisponível — não foi possível exportar stacks do Portainer."
+    warn "Stacks sem YAML em /root podem NÃO migrar."
+    return 1
+  fi
+
+  if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
+    warn "Sem usuário/senha do Portainer em dados_vps — pulando export API."
+    warn "Se alguma stack só existir no Portainer (sem /root/*.yaml), ela pode faltar no destino."
+    return 1
+  fi
+
+  local bases=()
+  local u
+  if [ -n "$PORTAINER_URL" ]; then
+    u="${PORTAINER_URL#https://}"
+    u="${u#http://}"
+    u="${u%/}"
+    bases+=("https://$u" "http://$u")
+  fi
+  # Acesso local (funciona mesmo se DNS ainda for externo)
+  bases+=("https://127.0.0.1:9443" "http://127.0.0.1:9000" "https://localhost:9443" "http://localhost:9000")
+
+  local base token=""
+  for base in "${bases[@]}"; do
+    token=$(curl -k -s --connect-timeout 5 -X POST "$base/api/auth" \
+      -H "Content-Type: application/json" \
+      -d "{\"username\":\"$PORTAINER_USER\",\"password\":\"$PORTAINER_PASS\"}" 2>/dev/null \
+      | jq -r '.jwt // empty' 2>/dev/null || true)
+    if [ -n "$token" ] && [ "$token" != "null" ]; then
+      ok "Portainer API autenticada em $base"
+      break
+    fi
+    token=""
+  done
+
+  if [ -z "$token" ]; then
+    warn "Não autenticou no Portainer — export API falhou."
+    warn "Stacks só no Portainer (sem YAML em /root) podem faltar. Confira dados_portainer."
+    return 1
+  fi
+
+  local stacks_json
+  stacks_json=$(curl -k -s --connect-timeout 10 -H "Authorization: Bearer $token" "$base/api/stacks" 2>/dev/null || true)
+  if [ -z "$stacks_json" ] || ! echo "$stacks_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    warn "Resposta inválida de /api/stacks"
+    return 1
+  fi
+
+  local count
+  count=$(echo "$stacks_json" | jq 'length')
+  info "Portainer reportou $count stack(s) — baixando compose..."
+
+  local i id name file_json content outfile
+  for i in $(seq 0 $((count - 1))); do
+    id=$(echo "$stacks_json" | jq -r ".[$i].Id")
+    name=$(echo "$stacks_json" | jq -r ".[$i].Name")
+    [ -z "$id" ] || [ "$id" = "null" ] && continue
+    [ -z "$name" ] || [ "$name" = "null" ] && continue
+
+    file_json=$(curl -k -s --connect-timeout 15 -H "Authorization: Bearer $token" \
+      "$base/api/stacks/${id}/file" 2>/dev/null || true)
+    content=$(echo "$file_json" | jq -r '.StackFileContent // empty' 2>/dev/null || true)
+
+    # Fallback: alguns Portainer embutem o conteúdo na listagem
+    if [ -z "$content" ]; then
+      content=$(echo "$stacks_json" | jq -r ".[$i].StackFileContent // empty" 2>/dev/null || true)
+    fi
+
+    if [ -z "$content" ]; then
+      warn "  Sem conteúdo compose: $name (id=$id)"
+      continue
+    fi
+
+    outfile="$EXPORTED_STACKS_DIR/${name}.yaml"
+    printf '%s\n' "$content" > "$outfile"
+    echo "$name" >> "$EXPORTED_STACKS_LIST"
+    PORTAINER_EXPORT_COUNT=$((PORTAINER_EXPORT_COUNT + 1))
+
+    # Garante que a stack aparece no inventário Swarm mesmo se docker stack ls falhar no nome
+    if ! grep -qx "$name" "$STACKS_FILE" 2>/dev/null; then
+      echo "$name" >> "$STACKS_FILE"
+    fi
+
+    if [ -f "/root/${name}.yaml" ] || [ -f "/root/${name}.yml" ]; then
+      ok "  $name (Portainer + já tinha em /root)"
+    else
+      ok "  $name (só no Portainer → exportado)"
+    fi
+  done
+
+  if [ "$PORTAINER_EXPORT_COUNT" -eq 0 ]; then
+    warn "Nenhuma stack exportada do Portainer."
+    return 1
+  fi
+  ok "$PORTAINER_EXPORT_COUNT definição(ões) de stack salva(s) para o destino"
+  return 0
 }
 
 show_inventory() {
@@ -326,6 +446,7 @@ show_inventory() {
   echo -e "  Volumes:      ${CIANO}$(wc -l < "$VOLUMES_FILE" | tr -d ' ')${RESET}"
   echo -e "  Dados:        ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  YAMLs /root:  ${CIANO}$(wc -l < "$YAML_LIST" | tr -d ' ')${RESET}"
+  echo -e "  Export Portainer: ${CIANO}${PORTAINER_EXPORT_COUNT}${RESET} (stacks com compose via API)"
   echo -e "  Pasta /root:  ${CIANO}${ROOT_HUMAN:-?}${RESET} (YAMLs, dados_vps e demais arquivos Orion)"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
@@ -464,6 +585,7 @@ show_summary_and_confirm() {
   echo -e "  Volumes:  $(wc -l < "$VOLUMES_FILE" | tr -d ' ')  ($TOTAL_HUMAN)"
   echo -e "  Redes:    $(wc -l < "$NETWORKS_FILE" | tr -d ' ')"
   echo -e "  YAMLs:    $(wc -l < "$YAML_LIST" | tr -d ' ')"
+  echo -e "  Portainer export: ${PORTAINER_EXPORT_COUNT} stack(s)"
   echo -e "  /root:    ${ROOT_HUMAN:-?} (pasta completa SetupOrion)"
   echo -e "  Tempo:    ~${ESTIMATED_MIN} min"
   echo ""
@@ -471,9 +593,11 @@ show_summary_and_confirm() {
   echo -e "  1. Instala Docker + Swarm no destino"
   echo -e "  2. Recria redes overlay e volumes"
   echo -e "  3. Pausa stacks na ORIGEM (dados consistentes)"
-  echo -e "  4. Transfere volumes + pasta /root (YAMLs, dados_vps, etc.)"
-  echo -e "  5. Sobe Traefik → Portainer → demais stacks"
+  echo -e "  4. Transfere volumes + /root + stacks exportadas do Portainer"
+  echo -e "  5. Sobe Traefik → Portainer → demais stacks (YAML /root + export API)"
   echo -e "  6. Origem permanece intacta (só pausada)"
+  echo -e "  ${AMARELO}Obs:${RESET} portainer_data NÃO é clonado (Swarm ID novo)."
+  echo -e "       As stacks vêm do export da API + arquivos em /root."
   echo ""
   echo -e "  ${VERMELHO}Após a migração, aponte o DNS A dos domínios para ${DEST_IP}${RESET}"
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
@@ -593,9 +717,10 @@ transfer_volume() {
   size=${size:-0}
 
   # Portainer guarda Swarm ID / stacks no volume — no destino o Swarm é novo.
-  # Copiar portainer_data deixa UI órfã; stacks sobem pelos YAMLs + docker stack deploy.
+  # Clonar portainer_data deixa a UI órfã. As stacks sobem pelo export da API + YAMLs.
   if [ "$vol" = "portainer_data" ]; then
-    warn "Pulando conteúdo de portainer_data (MVP: recria admin; stacks vêm dos YAMLs)"
+    warn "Pulando conteúdo de portainer_data (Swarm ID muda)"
+    warn "Stacks: export Portainer API (${PORTAINER_EXPORT_COUNT}) + YAMLs em /root"
     return 0
   fi
 
@@ -692,6 +817,37 @@ transfer_all() {
   done < "$VOLUMES_FILE"
 
   transfer_root || true
+  transfer_exported_stacks || true
+}
+
+transfer_exported_stacks() {
+  step "Enviando stacks exportadas do Portainer"
+  if [ ! -d "$EXPORTED_STACKS_DIR" ] || [ "$PORTAINER_EXPORT_COUNT" -eq 0 ]; then
+    warn "Nenhuma stack exportada para enviar"
+    return 0
+  fi
+
+  remote "mkdir -p /root /root/impa-exported-stacks"
+
+  local name f
+  while IFS= read -r name || [ -n "$name" ]; do
+    [ -z "$name" ] && continue
+    f="$EXPORTED_STACKS_DIR/${name}.yaml"
+    [ -f "$f" ] || continue
+
+    if "${SCP_BASE[@]}" "$f" "${DEST_USER}@${DEST_IP}:/root/impa-exported-stacks/${name}.yaml"; then
+      # Se /root ainda não tem esse YAML, coloca lá também (fonte do deploy)
+      if ! remote "test -f /root/${name}.yaml -o -f /root/${name}.yml"; then
+        remote "cp /root/impa-exported-stacks/${name}.yaml /root/${name}.yaml" \
+          && ok "  $name → /root/${name}.yaml (veio do Portainer)" \
+          || off "  Falha ao copiar $name para /root"
+      else
+        ok "  $name (backup em impa-exported-stacks; /root já tinha YAML)"
+      fi
+    else
+      off "  Falha SCP: $name"
+    fi
+  done < "$EXPORTED_STACKS_LIST"
 }
 
 # =============================================================================
@@ -768,8 +924,11 @@ restore_stacks() {
       deploy_stack_remote "$stack" "${stack}.yaml" && echo "$stack" >> "$deployed_list"
     elif remote "test -f /root/${stack}.yml"; then
       deploy_stack_remote "$stack" "${stack}.yml" && echo "$stack" >> "$deployed_list"
+    elif remote "test -f /root/impa-exported-stacks/${stack}.yaml"; then
+      remote "cp /root/impa-exported-stacks/${stack}.yaml /root/${stack}.yaml"
+      deploy_stack_remote "$stack" "${stack}.yaml" && echo "$stack" >> "$deployed_list"
     else
-      warn "Stack '$stack' sem YAML em /root — não foi possível redeploy automático"
+      warn "Stack '$stack' sem YAML em /root nem export Portainer — não redeployada"
     fi
   done < "$STACKS_FILE"
 }
