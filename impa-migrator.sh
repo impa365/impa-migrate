@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.9"
+IMPA_MIGRATOR_VERSION="1.1.10"
 
 # =============================================================================
 # Cores / UI
@@ -331,8 +331,8 @@ validate_origin_os() {
       ;;
     ubuntu)
       case "$ORIGIN_VERSION" in
-        22.04|23.04|23.10|24.04|24.10|25.04) ;;
-        *) die "Ubuntu $ORIGIN_VERSION não homologado. Use Ubuntu 22.04+." ;;
+        20.04|22.04|23.04|23.10|24.04|24.10|25.04) ;;
+        *) die "Ubuntu $ORIGIN_VERSION não homologado. Use Ubuntu 20.04+." ;;
       esac
       ;;
     *)
@@ -653,7 +653,7 @@ show_inventory() {
 # =============================================================================
 ask_destination() {
   step "Configurando VPS de destino"
-  echo -e "${BRANCO}A VPS de destino DEVE ser nova/limpa (Debian 11–13 ou Ubuntu 22.04+), sem Docker.${RESET}"
+  echo -e "${BRANCO}A VPS de destino DEVE ser nova/limpa (Debian 11–13 ou Ubuntu 20.04+), sem Docker.${RESET}"
   echo ""
 
   while true; do
@@ -741,7 +741,7 @@ REMOTE
       ;;
     ubuntu)
       case "$dest_ver" in
-        22.04|23.04|23.10|24.04|24.10|25.04) ok "Destino: Ubuntu $dest_ver" ;;
+        20.04|22.04|23.04|23.10|24.04|24.10|25.04) ok "Destino: Ubuntu $dest_ver" ;;
         *) die "Ubuntu $dest_ver no destino não homologado." ;;
       esac
       ;;

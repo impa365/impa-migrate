@@ -30,7 +30,7 @@ No navegador, `https://migrator.impa365.com` abre a landing da IMPA (copiar coma
 
 | Item | Valor |
 |------|--------|
-| SO | Debian 11/12/13 ou Ubuntu 22.04+ |
+| SO | Debian 11/12/13 ou Ubuntu 20.04+ |
 | Ambiente | Docker **Swarm** ativo (Portainer opcional) |
 | Acesso | root |
 | Deps | Instaladas no início se faltarem (`curl`, `jq`, `sshpass`, `tar`, `pv`…) |
@@ -39,7 +39,7 @@ No navegador, `https://migrator.impa365.com` abre a landing da IMPA (copiar coma
 
 | Item | Valor |
 |------|--------|
-| SO | Debian 11/12/13 ou Ubuntu 22.04+ |
+| SO | Debian 11/12/13 ou Ubuntu 20.04+ |
 | Estado | **Sem Docker** |
 | Arch | Igual à origem |
 | SSH | Chave ou senha (`sshpass` se senha) |
