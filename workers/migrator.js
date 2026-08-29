@@ -4,8 +4,9 @@
  * - curl/wget → impa-migrator.sh
  * - /install  → sempre o script
  */
-const SCRIPT_URL =
-  "https://raw.githubusercontent.com/impa365/impa-migrate/main/impa-migrator.sh";
+// Commit fixo — evita CDN da edge servir main desatualizado por POP (ex.: GRU)
+const SCRIPT_COMMIT = "1169ede12d390834b04e7b600b93d06fbb6309e2";
+const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
 const VERSION = "1.1.10";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
@@ -34,18 +35,18 @@ function wantsScript(request, pathname) {
 }
 
 async function serveScript() {
-  // ?v= evita servir script antigo do cache da edge após bump de versão
-  const upstream = await fetch(`${SCRIPT_URL}?v=${VERSION}`, {
-    cf: { cacheTtl: 300, cacheEverything: true },
+  const upstream = await fetch(SCRIPT_URL, {
+    cf: { cacheTtl: 0, cacheEverything: false },
   });
   const body = await upstream.text();
   return new Response(body, {
     status: upstream.status,
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "public, max-age=60, must-revalidate",
+      "Cache-Control": "no-store",
       "X-IMPA-Migrator": "script",
       "X-IMPA-Version": VERSION,
+      "X-IMPA-Script-Commit": SCRIPT_COMMIT.slice(0, 7),
     },
   });
 }
