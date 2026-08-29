@@ -1,6 +1,6 @@
 # IMPA Migrator
 
-**v. 1.1.4** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
+**v. 1.1.5** — one-liner interativo para migrar ambientes **Docker Swarm** (Portainer, stacks, volumes) de uma VPS para outra, sem clonar o sistema operacional.
 
 Desenvolvido pela **IMPA 365**. Ao usar, mantenha os créditos: [impa365.com](https://impa365.com) · [github.com/impa365/impa-migrate](https://github.com/impa365/impa-migrate)
 
@@ -62,6 +62,14 @@ O wizard pergunta se você já fez backup. Se disser não, confirma mais duas ve
 O migrador exporta stacks pela **API do Portainer** (quando há credenciais) e faz `docker stack deploy` no destino. O volume `portainer_data` **não** é clonado (Swarm ID novo deixa a UI órfã), mas o **admin é recriado automaticamente** com usuário/senha de `dados_portainer` — você entra com o mesmo login, sem setup manual.
 
 O `traefik.yaml` é ajustado no destino para **v3.6.1+** (Docker 29 quebra Traefik 3.5).
+
+## Ordem no destino (estilo SetupOrion)
+
+1. Docker + Swarm + redes + volumes vazios  
+2. `/root` (YAMLs + `dados_vps`)  
+3. **Traefik → Portainer → admin** (`dados_portainer`)  
+4. Freeze na origem + transferência dos volumes  
+5. **Demais stacks** (com Portainer já inicializado — evita status *Limited*)
 
 ## DNS
 

@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.4"
+IMPA_MIGRATOR_VERSION="1.1.5"
 
 # =============================================================================
 # Cores / UI
@@ -746,10 +746,9 @@ show_summary_and_confirm() {
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
   echo -e "  1. Instala Docker + Swarm no destino"
-  echo -e "  2. Recria redes overlay e volumes"
-  echo -e "  3. Pausa stacks na ORIGEM (cópia consistente dos bancos)"
-  echo -e "  4. Transfere volumes + /root + stacks exportadas do Portainer"
-  echo -e "  5. Sobe Traefik → Portainer → demais stacks"
+  echo -e "  2. Envia YAMLs/dados_vps e sobe Traefik → Portainer → admin"
+  echo -e "  3. Pausa origem e transfere volumes (consistência de banco)"
+  echo -e "  4. Sobe demais stacks (com Portainer já inicializado — sem Limited)"
   if [ "$ORIGIN_MODE" = "test" ]; then
     echo -e "  6. RELIGA a origem (você pode testar DNS na nova e voltar)"
   else
@@ -1020,8 +1019,13 @@ transfer_all() {
     transfer_volume "$vol" || true
   done < "$VOLUMES_FILE"
 
-  transfer_root || true
   transfer_exported_stacks || true
+}
+
+transfer_root_preflight() {
+  step "Enviando /root para o destino (YAMLs + dados_vps)"
+  echo -e "${BRANCO}Antes do freeze — só configuração, para subir Traefik/Portainer.${RESET}"
+  transfer_root || die "Falha ao enviar /root para o destino."
 }
 
 transfer_exported_stacks() {
@@ -1153,22 +1157,73 @@ find_stack_yaml() {
 }
 
 restore_stacks() {
-  step "Restaurando stacks no destino"
+  deploy_application_stacks
+}
+
+# SetupOrion: Docker → Traefik → Portainer → admin ANTES das demais stacks.
+# Stacks deployadas antes do admin ficam "Limited" no Portainer.
+bootstrap_dest_infra() {
+  step "Bootstrap no destino (estilo SetupOrion)"
+  echo -e "${BRANCO}Traefik → Portainer → admin (dados_portainer) → depois as outras stacks.${RESET}"
+  echo ""
 
   patch_traefik_for_modern_docker || true
+
+  if grep -qx "traefik" "$STACKS_FILE" 2>/dev/null; then
+    local yaml
+    yaml=$(find_stack_yaml "traefik" 2>/dev/null || true)
+    if [ -n "$yaml" ]; then
+      deploy_stack_remote "traefik" "$yaml" || die "Falha ao subir Traefik no destino."
+      info "Aguardando Traefik estabilizar (20s)..."
+      sleep 20
+    else
+      die "traefik.yaml ausente no destino."
+    fi
+  else
+    warn "Stack traefik não encontrada na origem — pulando."
+  fi
+
+  if grep -qx "portainer" "$STACKS_FILE" 2>/dev/null; then
+    local yaml
+    yaml=$(find_stack_yaml "portainer" 2>/dev/null || true)
+    if [ -n "$yaml" ]; then
+      deploy_stack_remote "portainer" "$yaml" || die "Falha ao subir Portainer no destino."
+      info "Aguardando Portainer (25s)..."
+      sleep 25
+      init_portainer_admin || die "Admin Portainer não criado — abortando (stacks ficariam Limited)."
+    else
+      die "portainer.yaml ausente no destino."
+    fi
+  else
+    warn "Stack portainer não encontrada — demais stacks podem ficar Limited."
+  fi
+
+  ok "Infra pronta — Portainer inicializado"
+}
+
+deploy_application_stacks() {
+  step "Restaurando stacks de aplicação no destino"
+  echo -e "${BRANCO}Só após admin Portainer existir (evita stacks Limited).${RESET}"
+  echo ""
 
   local deployed_list="$STATE_DIR/deployed.txt"
   local failed_list="$STATE_DIR/deploy_failed.txt"
   : > "$deployed_list"
   : > "$failed_list"
+  grep -qx "traefik" "$STACKS_FILE" 2>/dev/null && echo "traefik" >> "$deployed_list"
+  grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && echo "portainer" >> "$deployed_list"
 
-  local stack_total deploy_i yaml_file
+  local stack_total deploy_i
   stack_total=$(wc -l < "$STACKS_FILE" | tr -d ' ')
   deploy_i=0
 
   deploy_one_stack() {
     local name="$1"
     local yaml
+
+    case "$name" in
+      traefik|portainer) return 0 ;;
+    esac
 
     if grep -qx "$name" "$deployed_list" 2>/dev/null; then
       return 0
@@ -1182,20 +1237,9 @@ restore_stacks() {
     fi
 
     deploy_i=$((deploy_i + 1))
-    info "[$deploy_i/$stack_total] Deploy: $name ($yaml)"
+    info "[$deploy_i] Deploy: $name ($yaml)"
     if deploy_stack_remote "$name" "$yaml"; then
       echo "$name" >> "$deployed_list"
-      case "$name" in
-        traefik)
-          info "Aguardando Traefik estabilizar (20s)..."
-          sleep 20
-          ;;
-        portainer)
-          info "Aguardando Portainer (25s)..."
-          sleep 25
-          init_portainer_admin || true
-          ;;
-      esac
       return 0
     fi
 
@@ -1203,13 +1247,10 @@ restore_stacks() {
     return 1
   }
 
-  # Infra primeiro: Traefik → Portainer → bancos → resto (ordem alfabética)
-  local priority=(traefik portainer postgres pgvector)
+  local priority=(postgres pgvector)
   local p
   for p in "${priority[@]}"; do
-    if grep -qx "$p" "$STACKS_FILE" 2>/dev/null; then
-      deploy_one_stack "$p" || true
-    fi
+    grep -qx "$p" "$STACKS_FILE" 2>/dev/null && deploy_one_stack "$p" || true
   done
 
   while IFS= read -r stack || [ -n "$stack" ]; do
@@ -1399,9 +1440,11 @@ main() {
   show_summary_and_confirm
 
   provision_destination
+  transfer_root_preflight
+  bootstrap_dest_infra
   freeze_origin
   transfer_all
-  restore_stacks
+  deploy_application_stacks
   validate_migration
 
   if [ "$ORIGIN_MODE" = "test" ]; then
