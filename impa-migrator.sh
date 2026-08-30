@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.12"
+IMPA_MIGRATOR_VERSION="1.1.13"
 
 # =============================================================================
 # Cores / UI
@@ -55,6 +55,7 @@ PORTAINER_URL=""
 PORTAINER_USER=""
 PORTAINER_PASS=""
 PORTAINER_DEST_DOMAIN=""
+ORIGIN_PUBLIC_IP=""
 FAILED_STEPS=0
 
 # =============================================================================
@@ -350,6 +351,11 @@ validate_origin_os() {
   fi
 
   ok "SO origem: $PRETTY_NAME ($ORIGIN_ARCH)"
+  ORIGIN_PUBLIC_IP=$(curl -s --connect-timeout 4 https://api.ipify.org 2>/dev/null | tr -d '\r\n' || true)
+  if [ -z "$ORIGIN_PUBLIC_IP" ]; then
+    ORIGIN_PUBLIC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  fi
+  [ -n "$ORIGIN_PUBLIC_IP" ] && ok "IP público origem: $ORIGIN_PUBLIC_IP"
 }
 
 require_docker_swarm() {
@@ -833,7 +839,7 @@ show_summary_and_confirm() {
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
   echo -e "  1. Instala Docker + Swarm no destino"
-  echo -e "  2. Envia YAMLs/dados_vps e sobe Traefik → Portainer → admin"
+  echo -e "  2. Envia YAMLs/dados_vps, sobe Traefik/Portainer (DNS do Portainer deve apontar pro destino)"
   echo -e "  3. Pausa origem e transfere volumes (consistência de banco)"
   echo -e "  4. Ativa no Portainer só as stacks que estavam ativas na origem (YAML extra em /root só copia)"
   if [ "$ORIGIN_MODE" = "test" ]; then
@@ -1231,10 +1237,90 @@ portainer_dest_domain() {
   domain="${domain#http://}"
   domain="${domain%/}"
   if [ -z "$domain" ]; then
-    domain=$(remote "grep -oE 'Host\\(\\\`[^\\\`]+\\\`\\)' /root/portainer.yaml 2>/dev/null | head -1 | sed -E 's/Host\\(\\\`([^\\\`]+)\\\`\\)/\\1/'" 2>/dev/null | tr -d '\r' || true)
+    domain=$(remote "grep -oE 'Host\\(\\\`[^\\\`]+\\\`\\)' /root/portainer.yaml /root/impa-exported-stacks/portainer.yaml 2>/dev/null | head -1 | sed -E 's/Host\\(\\\`([^\\\`]+)\\\`\\)/\\1/'" 2>/dev/null | tr -d '\r' || true)
   fi
   [ -z "$domain" ] && domain="portainer.local"
   PORTAINER_DEST_DOMAIN="$domain"
+}
+
+resolve_domain_a() {
+  local domain="$1" ip=""
+  if command -v getent >/dev/null 2>&1; then
+    ip=$(getent ahosts "$domain" 2>/dev/null | awk '{print $1; exit}')
+  fi
+  if [ -z "$ip" ] && command -v dig >/dev/null 2>&1; then
+    ip=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+  fi
+  if [ -z "$ip" ] && command -v host >/dev/null 2>&1; then
+    ip=$(host -t A "$domain" 2>/dev/null | awk '/has address/{print $4; exit}')
+  fi
+  echo "$ip"
+}
+
+is_cloudflare_ip() {
+  case "$1" in
+    104.*|172.67.*|173.245.*|141.101.*|108.162.*|190.93.*|188.114.*|197.234.*|198.41.*|162.158.*|103.21.*|103.22.*|103.31.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_dns_to_dest() {
+  local domain="$1"
+  local ctx="${2:-DNS}"
+  [ -n "$domain" ] || { portainer_dest_domain; domain="$PORTAINER_DEST_DOMAIN"; }
+  [ -n "$domain" ] || return 0
+
+  step "Verificando DNS — $ctx"
+  echo -e "${BRANCO}Domínio:${RESET} ${CIANO}${domain}${RESET}"
+  echo -e "${BRANCO}IP da VPS nova (destino):${RESET} ${CIANO}${DEST_IP}${RESET}"
+  if [ -n "$ORIGIN_PUBLIC_IP" ]; then
+    echo -e "${BRANCO}IP da VPS antiga (origem):${RESET} ${CIANO}${ORIGIN_PUBLIC_IP}${RESET}"
+  fi
+  echo ""
+  echo -e "${VERMELHO}O Portainer e os apps só funcionam se o DNS apontar para a VPS NOVA.${RESET}"
+  echo -e "${BRANCO}Atualize o registro A (ou Cloudflare → ${DEST_IP}) e aguarde a propagação.${RESET}"
+  echo -e "${BRANCO}Sem isso o admin do Portainer não é criado e a migração não continua.${RESET}"
+  echo ""
+
+  while true; do
+    local resolved
+    resolved=$(resolve_domain_a "$domain")
+
+    if [ "$resolved" = "$DEST_IP" ]; then
+      ok "DNS OK: $domain → $DEST_IP"
+      if remote "curl -sk -o /dev/null -w '%{http_code}' -H 'Host: $domain' https://127.0.0.1/ 2>/dev/null" | grep -qE '^(200|301|302|307|308|401|404|503)$'; then
+        ok "Traefik no destino responde para Host: $domain"
+      else
+        warn "DNS OK, mas Traefik ainda não responde — aguardando stack estabilizar..."
+        sleep 8
+        if remote "curl -sk -o /dev/null -w '%{http_code}' -H 'Host: $domain' https://127.0.0.1/ 2>/dev/null" | grep -qE '^(200|301|302|307|308|401|404|503)$'; then
+          ok "Traefik respondeu na segunda checagem"
+        else
+          warn "Traefik sem resposta — verifique traefik/portainer no destino após DNS OK"
+        fi
+      fi
+      return 0
+    fi
+
+    if [ -n "$resolved" ] && is_cloudflare_ip "$resolved"; then
+      warn "$domain → $resolved (Cloudflare proxy)"
+      echo -e "${BRANCO}Com proxy laranja: no Cloudflare, o A record de ${domain} deve ser ${DEST_IP}.${RESET}"
+      if confirm_yn "Já atualizei no Cloudflare — A record aponta para ${DEST_IP}"; then
+        ok "DNS confirmado (Cloudflare proxy)"
+        return 0
+      fi
+    elif [ -n "$resolved" ]; then
+      warn "$domain → $resolved (esperado: ${DEST_IP})"
+      if [ -n "$ORIGIN_PUBLIC_IP" ] && [ "$resolved" = "$ORIGIN_PUBLIC_IP" ]; then
+        echo -e "${VERMELHO}Ainda aponta para a VPS ANTIGA — troque o A record antes de continuar.${RESET}"
+      fi
+    else
+      warn "Não resolveu $domain (propagação ou registro ausente)"
+    fi
+
+    echo ""
+    read -r -p "$(echo -e "${AMARELO}Aponte o DNS e pressione ENTER para verificar de novo (Ctrl+C cancela): ${RESET}")" _
+  done
 }
 
 # SetupOrion: apps via API do Portainer (controle total). Só traefik/portainer usam docker stack deploy.
@@ -1400,7 +1486,9 @@ bootstrap_dest_infra() {
       deploy_stack_remote "portainer" "$yaml" || die "Falha ao subir Portainer no destino."
       info "Aguardando Portainer (25s)..."
       sleep 25
-      init_portainer_admin || die "Admin Portainer não criado — necessário para deploy via API."
+      portainer_dest_domain
+      require_dns_to_dest "$PORTAINER_DEST_DOMAIN" "Portainer (obrigatório antes do admin)"
+      init_portainer_admin || die "Admin Portainer não criado — confira DNS, Traefik e logs do portainer."
     else
       die "portainer.yaml ausente no destino."
     fi
@@ -1420,6 +1508,9 @@ deploy_application_stacks() {
     warn "Nenhuma app para ativar no Portainer — pulando deploy de aplicações."
     return 0
   fi
+
+  portainer_dest_domain
+  require_dns_to_dest "$PORTAINER_DEST_DOMAIN" "Portainer (antes das apps)"
 
   init_portainer_dest_api
 
@@ -1537,49 +1628,51 @@ init_portainer_admin() {
     return 1
   fi
 
-  local domain="${PORTAINER_URL#https://}"
-  domain="${domain#http://}"
-  domain="${domain%/}"
-  [ -z "$domain" ] && domain="portainer.local"
+  portainer_dest_domain
+  local domain="$PORTAINER_DEST_DOMAIN"
+  local user_b64 pass_b64 out rc=0
+  user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
+  pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
 
-  local payload_b64 setup_token response i
-  if command -v jq >/dev/null 2>&1; then
-    payload_b64=$(jq -n --arg u "$PORTAINER_USER" --arg p "$PORTAINER_PASS" '{Username:$u,Password:$p}' | base64 -w0 2>/dev/null || jq -n --arg u "$PORTAINER_USER" --arg p "$PORTAINER_PASS" '{Username:$u,Password:$p}' | base64)
-  else
-    payload_b64=$(printf '%s' "{\"Username\":\"$PORTAINER_USER\",\"Password\":\"$PORTAINER_PASS\"}" | base64 -w0 2>/dev/null || printf '%s' "{\"Username\":\"$PORTAINER_USER\",\"Password\":\"$PORTAINER_PASS\"}" | base64)
+  out=$(remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' 2>&1) || rc=$?
+set -euo pipefail
+DOMAIN=$(echo "$DOMAIN" | tr -d '\r')
+USER=$(echo "$USER_B64" | base64 -d)
+PASS=$(echo "$PASS_B64" | base64 -d)
+if command -v jq >/dev/null 2>&1; then
+  PAYLOAD=$(jq -n --arg u "$USER" --arg p "$PASS" '{Username:$u,Password:$p}')
+else
+  PAYLOAD=$(printf '{"Username":"%s","Password":"%s"}' "$USER" "$PASS")
+fi
+
+for i in $(seq 1 15); do
+  SETUP_TOKEN=$(docker service logs portainer_portainer 2>&1 | grep -oE 'setup_token=[a-f0-9]+' | tail -1 | cut -d= -f2 || true)
+  for BASE in "https://127.0.0.1" "http://127.0.0.1:9000"; do
+    URL="${BASE}/api/users/admin/init"
+    if [ -n "$SETUP_TOKEN" ]; then
+      RESP=$(curl -sk -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
+        -H "X-Setup-Token: $SETUP_TOKEN" -d "$PAYLOAD" 2>/dev/null || true)
+    else
+      RESP=$(curl -sk -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
+        -d "$PAYLOAD" 2>/dev/null || true)
+    fi
+    if echo "$RESP" | grep -q '"Username"'; then echo "OK:created"; exit 0; fi
+    if echo "$RESP" | grep -qiE 'already|exists|initialized'; then echo "OK:exists"; exit 0; fi
+  done
+  sleep 6
+done
+echo "FAIL:timeout"
+exit 1
+REMOTE
+
+  if echo "$out" | grep -q '^OK:'; then
+    ok "Admin Portainer criado: $PORTAINER_USER (@$domain)"
+    return 0
   fi
 
-  for i in $(seq 1 12); do
-    setup_token=$(remote "docker service logs portainer_portainer 2>&1 | grep -oE 'setup_token=[a-f0-9]+' | tail -1 | cut -d= -f2" 2>/dev/null | tr -d '\r\n')
-
-    # Via Traefik local — não depende de DNS público apontar pro destino
-    if [ -n "$setup_token" ]; then
-      response=$(remote "payload=\$(echo '$payload_b64' | base64 -d); curl -sk -X POST 'https://127.0.0.1/api/users/admin/init' \
-        -H 'Host: $domain' -H 'Content-Type: application/json' -H 'X-Setup-Token: $setup_token' \
-        -d \"\$payload\"" 2>/dev/null || true)
-    else
-      response=$(remote "payload=\$(echo '$payload_b64' | base64 -d); curl -sk -X POST 'https://127.0.0.1/api/users/admin/init' \
-        -H 'Host: $domain' -H 'Content-Type: application/json' \
-        -d \"\$payload\"" 2>/dev/null || true)
-    fi
-
-    if echo "$response" | grep -q '"Username"'; then
-      ok "Admin Portainer criado: $PORTAINER_USER"
-      info "Você não precisa do setup token — já entrou com o login antigo."
-      return 0
-    fi
-    if echo "$response" | grep -qiE 'already|exists|initialized'; then
-      ok "Admin Portainer já existe — use $PORTAINER_USER"
-      return 0
-    fi
-
-    info "Tentativa $i/12 — aguardando Portainer/Traefik..."
-    sleep 6
-  done
-
   warn "Não foi possível criar o admin automaticamente."
-  warn "Crie manualmente com o usuário/senha definidos nesta migração"
-  warn "ou use o setup_token nos logs: docker service logs portainer_portainer"
+  [ -n "$out" ] && warn "Detalhe: $(echo "$out" | tail -3 | tr '\n' ' ')"
+  warn "Verifique DNS → ${DEST_IP}, Traefik e: docker service logs portainer_portainer"
   return 1
 }
 
