@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.19"
+IMPA_MIGRATOR_VERSION="1.1.20"
 
 # =============================================================================
 # Cores / UI
@@ -1021,6 +1021,23 @@ freeze_origin() {
 
 unfreeze_origin() {
   step "Religando stacks na origem (modo teste)"
+  echo -e "${BRANCO}docker service scale aguarda convergência — com ~30+ serviços parece travado.${RESET}"
+  echo -e "${BRANCO}Usando scale em background (-d); leva ~1 min para estabilizar.${RESET}"
+  echo ""
+
+  scale_service_detach() {
+    local svc="$1" replicas="$2"
+    replicas=${replicas:-1}
+    [ "$replicas" -lt 1 ] 2>/dev/null && replicas=1
+    if docker service scale -d "${svc}=${replicas}" >/dev/null 2>&1; then
+      ok "  $svc → $replicas"
+    elif docker service update -d --replicas "$replicas" "$svc" >/dev/null 2>&1; then
+      ok "  $svc → $replicas (update)"
+    else
+      warn "  Falha ao religar $svc"
+    fi
+  }
+
   if [ ! -s "$REPLICAS_FILE" ]; then
     warn "Sem mapa de replicas salvo — tentando scale=1 em todos os serviços das stacks"
     while IFS= read -r stack || [ -n "$stack" ]; do
@@ -1029,25 +1046,24 @@ unfreeze_origin() {
       services=$(docker stack services "$stack" --format '{{.Name}}' 2>/dev/null || true)
       while IFS= read -r svc || [ -n "$svc" ]; do
         [ -z "$svc" ] && continue
-        docker service scale "${svc}=1" >/dev/null 2>&1 && ok "  $svc → 1" || warn "  Falha ao religar $svc"
+        scale_service_detach "$svc" 1
       done <<< "$services"
     done < "$STACKS_FILE"
-    return 0
+  else
+    local total
+    total=$(wc -l < "$REPLICAS_FILE" | tr -d ' ')
+    info "Religando $total serviço(s) na origem…"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -z "$line" ] && continue
+      local svc replicas
+      svc=$(echo "$line" | awk '{print $1}')
+      replicas=$(echo "$line" | awk '{print $2}')
+      scale_service_detach "$svc" "$replicas"
+    done < "$REPLICAS_FILE"
   fi
 
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -z "$line" ] && continue
-    local svc replicas
-    svc=$(echo "$line" | awk '{print $1}')
-    replicas=$(echo "$line" | awk '{print $2}')
-    replicas=${replicas:-1}
-    [ "$replicas" -lt 1 ] 2>/dev/null && replicas=1
-    if docker service scale "${svc}=${replicas}" >/dev/null 2>&1; then
-      ok "  $svc → $replicas"
-    else
-      warn "  Falha ao religar $svc"
-    fi
-  done < "$REPLICAS_FILE"
+  info "Aguardando Swarm estabilizar na origem (60s)…"
+  sleep 60
   ok "Origem religada — você pode apontar DNS para a nova e voltar se quiser"
 }
 
@@ -1936,6 +1952,28 @@ REMOTE
 # =============================================================================
 validate_migration() {
   step "Validando destino"
+  info "Stacks via Portainer podem levar ~30–90s para aparecer em docker stack ls"
+  echo ""
+
+  local try=0 max_try=6 missing=0
+  while [ "$try" -lt "$max_try" ]; do
+    missing=0
+    while IFS= read -r stack || [ -n "$stack" ]; do
+      [ -z "$stack" ] && continue
+      remote "docker stack ls --format '{{.Name}}' | grep -qx '$stack'" || missing=$((missing + 1))
+    done < <(
+      {
+        grep -qx "traefik" "$STACKS_FILE" 2>/dev/null && echo "traefik"
+        grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && echo "portainer"
+        [ -f "$PORTAINER_DEPLOY_FILE" ] && cat "$PORTAINER_DEPLOY_FILE"
+      } | sort -u
+    )
+    [ "$missing" -eq 0 ] && break
+    try=$((try + 1))
+    [ "$try" -lt "$max_try" ] && info "Aguardando stacks ($missing ausente(s))… retry $try/$max_try (15s)"
+    sleep 15
+  done
+
   echo ""
   echo -e "${BRANCO}Stacks no destino:${RESET}"
   remote "docker stack ls" || warn "Não listou stacks"
@@ -1945,7 +1983,7 @@ validate_migration() {
   remote "docker service ls" || warn "Não listou serviços"
 
   echo ""
-  local expected dest_stacks missing=0
+  local expected dest_stacks
   expected=0
   grep -qx "traefik" "$STACKS_FILE" 2>/dev/null && expected=$((expected + 1))
   grep -qx "portainer" "$STACKS_FILE" 2>/dev/null && expected=$((expected + 1))
@@ -1979,7 +2017,12 @@ validate_migration() {
   )
 
   if [ "$missing" -gt 0 ]; then
-    warn "$missing stack(s) ausente(s) — revise o log"
+    warn "$missing stack(s) ausente(s) em docker stack ls — confira no Portainer (serviços podem estar 1/1)"
+    remote "docker service ls --format '{{.Name}} {{.Replicas}}' | awk '\$2!~/1\\/1/ && \$2!~/0\\/0/ {print}'" 2>/dev/null \
+      | while IFS= read -r bad || [ -n "$bad" ]; do
+          [ -z "$bad" ] && continue
+          warn "  Serviço com problema: $bad"
+        done
   else
     ok "Todas as stacks esperadas estão no destino"
   fi
