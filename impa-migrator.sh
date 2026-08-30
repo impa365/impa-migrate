@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.16"
+IMPA_MIGRATOR_VERSION="1.1.17"
 
 # =============================================================================
 # Cores / UI
@@ -1547,7 +1547,7 @@ deploy_stack_via_portainer() {
   remote "test -f /root/$file" || { off "YAML ausente no destino: $file"; return 1; }
 
   local out rc=0
-  out=$(remote_script "NAME='$name' YAML='/root/$file' bash -s" <<'REMOTE' 2>&1) || rc=$?
+  out=$(remote_script "NAME='$name' YAML='/root/$file' bash -s" <<'REMOTE' 2>&1
 set -euo pipefail
 source /tmp/impa-portainer-api.env
 TOKEN=$(echo "$TOKEN_B64" | base64 -d)
@@ -1583,7 +1583,7 @@ echo "HTTP_$http_code"
 cat /tmp/impa_stack_resp.json 2>/dev/null || true
 exit 1
 REMOTE
-
+) || rc=$?
   if [ "$rc" -eq 0 ] && echo "$out" | grep -qx "OK"; then
     ok "Stack via Portainer API: $name"
     return 0
@@ -1797,9 +1797,8 @@ init_portainer_admin() {
   user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
   pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
 
-  out=$(remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' 2>&1) || rc=$?
+  out=$(remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' 2>&1
 set -euo pipefail
-DOMAIN=$(echo "$DOMAIN" | tr -d '\r')
 USER=$(echo "$USER_B64" | base64 -d)
 PASS=$(echo "$PASS_B64" | base64 -d)
 if command -v jq >/dev/null 2>&1; then
@@ -1827,7 +1826,7 @@ done
 echo "FAIL:timeout"
 exit 1
 REMOTE
-
+) || rc=$?
   if echo "$out" | grep -q '^OK:'; then
     ok "Admin Portainer criado: $PORTAINER_USER (@$domain)"
     return 0
