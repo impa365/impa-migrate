@@ -63,31 +63,21 @@ $scriptName = "impa-migrator"
 $workerPath = Join-Path $Root "workers\migrator.js"
 $workerBytes = [System.IO.File]::ReadAllBytes($workerPath)
 
-# KV for telemetry persistence
-$kvTitle = "impa-migrator-telemetry"
-$kvList = Invoke-RestMethod -Method GET -Uri "https://api.cloudflare.com/client/v4/accounts/$accountId/storage/kv/namespaces?per_page=100" -Headers $headersJson
-$kvNs = @($kvList.result | Where-Object { $_.title -eq $kvTitle })
-if ($kvNs.Count -gt 0) {
-  $kvId = $kvNs[0].id
-  Write-Host "KV existing $kvTitle"
-} else {
-  $kvCreate = Invoke-RestMethod -Method POST -Uri "https://api.cloudflare.com/client/v4/accounts/$accountId/storage/kv/namespaces" -Headers $headersJson -Body (@{ title = $kvTitle } | ConvertTo-Json)
-  if (-not $kvCreate.success) { throw "KV create failed" }
-  $kvId = $kvCreate.result.id
-  Write-Host "KV created $kvTitle"
-}
-
-$boundary = [guid]::NewGuid().ToString("N")
-$utf8 = New-Object System.Text.UTF8Encoding $false
+# Durable Object for telemetry (token does not have Workers KV permission)
 $metaObj = @{
   main_module = "migrator.js"
   compatibility_date = "2024-11-01"
   bindings = @(
-    @{ type = "kv_namespace"; name = "TELEMETRY"; namespace_id = $kvId }
+    @{ type = "durable_object_namespace"; name = "TELEMETRY_DO"; class_name = "TelemetryStore" }
+  )
+  migrations = @(
+    @{ tag = "v1-telemetry-do"; new_classes = @("TelemetryStore") }
   )
 }
-$meta = $metaObj | ConvertTo-Json -Compress -Depth 6
+$meta = $metaObj | ConvertTo-Json -Compress -Depth 8
 
+$boundary = [guid]::NewGuid().ToString("N")
+$utf8 = New-Object System.Text.UTF8Encoding $false
 $sb = New-Object System.IO.MemoryStream
 function Add-TextPart($name, $filename, $contentType, $text) {
   $header = "--$boundary`r`nContent-Disposition: form-data; name=`"$name`""

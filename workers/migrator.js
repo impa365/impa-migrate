@@ -78,21 +78,7 @@ function emptyStats() {
   };
 }
 
-async function loadStats(env) {
-  if (!env?.TELEMETRY) return emptyStats();
-  try {
-    const raw = await env.TELEMETRY.get("stats");
-    if (!raw) return emptyStats();
-    const data = JSON.parse(raw);
-    return { ...emptyStats(), ...data };
-  } catch {
-    return emptyStats();
-  }
-}
-
-async function persistEvent(env, event) {
-  if (!env?.TELEMETRY) return;
-  const stats = await loadStats(env);
+function applyEvent(stats, event) {
   const step = event.step || "unknown";
   stats.byStep[step] = (stats.byStep[step] || 0) + 1;
   if (event.version) {
@@ -125,8 +111,50 @@ async function persistEvent(env, event) {
     }
     stats.servers = stats.servers.slice(0, 250);
   }
+  return stats;
+}
 
-  await env.TELEMETRY.put("stats", JSON.stringify(stats));
+function doStub(env) {
+  if (!env?.TELEMETRY_DO) return null;
+  return env.TELEMETRY_DO.get(env.TELEMETRY_DO.idFromName("global"));
+}
+
+async function loadStats(env) {
+  const stub = doStub(env);
+  if (!stub) return emptyStats();
+  try {
+    const res = await stub.fetch("https://telemetry/stats");
+    if (!res.ok) return emptyStats();
+    return { ...emptyStats(), ...(await res.json()) };
+  } catch {
+    return emptyStats();
+  }
+}
+
+async function persistEvent(env, event) {
+  const stub = doStub(env);
+  if (!stub) return;
+  await stub.fetch("https://telemetry/event", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(event),
+  });
+}
+
+export class TelemetryStore {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+  async fetch(request) {
+    let stats = (await this.ctx.storage.get("stats")) || emptyStats();
+    if (request.method === "POST") {
+      const event = await request.json();
+      stats = applyEvent(stats, event);
+      await this.ctx.storage.put("stats", stats);
+      return new Response("ok");
+    }
+    return Response.json(stats);
+  }
 }
 
 async function handleTelemetry(request, env) {
