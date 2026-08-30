@@ -5,7 +5,7 @@
  * - /install  → sempre o script
  */
 // Commit fixo — evita CDN da edge servir main desatualizado por POP (ex.: GRU)
-const SCRIPT_COMMIT = "e3c8f4dd8d97679e9e2242f7ee0fae0e2db4b1c8";
+const SCRIPT_COMMIT = "6919ff0a373dd178c954a33beaec3b1c6ab73c8e";
 const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
 const VERSION = "1.1.21";
