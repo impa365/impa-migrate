@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.15"
+IMPA_MIGRATOR_VERSION="1.1.16"
 
 # =============================================================================
 # Cores / UI
@@ -277,7 +277,18 @@ install_origin_deps() {
 # =============================================================================
 # SSH helpers
 # =============================================================================
+sanitize_dest_known_hosts() {
+  [ -n "$DEST_IP" ] || return 0
+  local kh="${HOME}/.ssh/known_hosts"
+  [ -f "$kh" ] || return 0
+  if grep -qE "(^|,)${DEST_IP}([, ]|$)" "$kh" 2>/dev/null; then
+    ssh-keygen -f "$kh" -R "$DEST_IP" >/dev/null 2>&1 || true
+    log "known_hosts: removida chave antiga de $DEST_IP (VPS restaurada/reinstalada)"
+  fi
+}
+
 build_ssh() {
+  sanitize_dest_known_hosts
   SSH_BASE=(ssh "${SSH_OPTS[@]}")
   SCP_BASE=(scp "${SSH_OPTS[@]}")
   if [ "$DEST_AUTH_MODE" = "key" ]; then
@@ -743,6 +754,8 @@ preflight_destination() {
     warn "Não conectou em ${DEST_USER}@${DEST_IP}."
     if [ "$DEST_AUTH_MODE" = "password" ]; then
       echo -e "${BRANCO}Verifique IP, usuário e senha — você pode tentar de novo.${RESET}"
+      echo -e "${BRANCO}Se restaurou a VPS destino, a chave SSH antiga em known_hosts já foi limpa — tente de novo.${RESET}"
+      sanitize_dest_known_hosts
       prompt_dest_password
     else
       die "Verifique a chave SSH e o acesso a ${DEST_USER}@${DEST_IP}."
