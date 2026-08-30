@@ -63,12 +63,30 @@ $scriptName = "impa-migrator"
 $workerPath = Join-Path $Root "workers\migrator.js"
 $workerBytes = [System.IO.File]::ReadAllBytes($workerPath)
 
+# KV for telemetry persistence
+$kvTitle = "impa-migrator-telemetry"
+$kvList = Invoke-RestMethod -Method GET -Uri "https://api.cloudflare.com/client/v4/accounts/$accountId/storage/kv/namespaces?per_page=100" -Headers $headersJson
+$kvNs = @($kvList.result | Where-Object { $_.title -eq $kvTitle })
+if ($kvNs.Count -gt 0) {
+  $kvId = $kvNs[0].id
+  Write-Host "KV existing $kvTitle"
+} else {
+  $kvCreate = Invoke-RestMethod -Method POST -Uri "https://api.cloudflare.com/client/v4/accounts/$accountId/storage/kv/namespaces" -Headers $headersJson -Body (@{ title = $kvTitle } | ConvertTo-Json)
+  if (-not $kvCreate.success) { throw "KV create failed" }
+  $kvId = $kvCreate.result.id
+  Write-Host "KV created $kvTitle"
+}
+
 $boundary = [guid]::NewGuid().ToString("N")
 $utf8 = New-Object System.Text.UTF8Encoding $false
-$meta = @{
+$metaObj = @{
   main_module = "migrator.js"
   compatibility_date = "2024-11-01"
-} | ConvertTo-Json -Compress
+  bindings = @(
+    @{ type = "kv_namespace"; name = "TELEMETRY"; namespace_id = $kvId }
+  )
+}
+$meta = $metaObj | ConvertTo-Json -Compress -Depth 6
 
 $sb = New-Object System.IO.MemoryStream
 function Add-TextPart($name, $filename, $contentType, $text) {
@@ -122,8 +140,31 @@ if ($existingRoute.Count -gt 0) {
   Write-Host "ROUTE created"
 }
 
+# Admin password (painel-senha.txt is gitignored)
+$painelPassPath = Join-Path $Root "painel-senha.txt"
+if (-not (Test-Path $painelPassPath)) {
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $bytes = New-Object byte[] 18
+  $rng.GetBytes($bytes)
+  $generated = ([Convert]::ToBase64String($bytes) -replace '[+/=]', 'x').Substring(0, 22)
+  Set-Content -Path $painelPassPath -Value $generated -NoNewline -Encoding ascii
+  Write-Host "Generated painel-senha.txt"
+}
+$adminPassword = (Get-Content -Raw $painelPassPath).Trim()
+$secretBody = @{ name = "ADMIN_PASSWORD"; text = $adminPassword; type = "secret_text" } | ConvertTo-Json
+$secretUri = "https://api.cloudflare.com/client/v4/accounts/$accountId/workers/scripts/$scriptName/secrets"
+try {
+  Invoke-RestMethod -Method PUT -Uri $secretUri -Headers $headersJson -Body $secretBody | Out-Null
+  Write-Host "ADMIN_PASSWORD secret set"
+} catch {
+  Write-Host "SECRET_FAIL"
+  $_.ErrorDetails.Message
+  throw
+}
+
 Write-Host "DONE"
 Write-Host "Browser: https://migrator.impa365.com"
+Write-Host "Painel:  https://migrator.impa365.com/painel"
 Write-Host "Script:  curl -sSL https://migrator.impa365.com | head"
 Write-Host "Install: curl -sSL https://migrator.impa365.com/install | head"
 

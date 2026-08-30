@@ -5,9 +5,9 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.21"
+IMPA_MIGRATOR_VERSION="1.1.22"
 
-# Telemetria anônima (etapa + versão). Desative: IMPA_TELEMETRY=0
+# Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
 IMPA_TELEMETRY_RUN_ID=""
 
@@ -80,7 +80,6 @@ impa_telemetry_init() {
 
 impa_telemetry() {
   local step="$1"
-  [ "${IMPA_TELEMETRY:-1}" = "0" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
   local payload
   payload=$(printf '{"step":"%s","version":"%s","mode":"%s","run":"%s"}' \
