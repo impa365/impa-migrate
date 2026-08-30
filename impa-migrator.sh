@@ -5,7 +5,11 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.20"
+IMPA_MIGRATOR_VERSION="1.1.21"
+
+# Telemetria anônima (etapa + versão). Desative: IMPA_TELEMETRY=0
+IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
+IMPA_TELEMETRY_RUN_ID=""
 
 # =============================================================================
 # Cores / UI
@@ -70,6 +74,22 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+impa_telemetry_init() {
+  IMPA_TELEMETRY_RUN_ID="$(date +%s)-$$"
+}
+
+impa_telemetry() {
+  local step="$1"
+  [ "${IMPA_TELEMETRY:-1}" = "0" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local payload
+  payload=$(printf '{"step":"%s","version":"%s","mode":"%s","run":"%s"}' \
+    "$step" "$IMPA_MIGRATOR_VERSION" "${ORIGIN_MODE:-}" "${IMPA_TELEMETRY_RUN_ID:-}")
+  ( curl -fsS -m 4 -X POST "$IMPA_TELEMETRY_URL" \
+      -H "Content-Type: application/json" \
+      -d "$payload" >/dev/null 2>&1 & ) || true
+}
+
 ok()   { echo -e "${VERDE}✓${RESET} ${BRANCO}$1${RESET}"; log "OK: $1"; }
 off()  { echo -e "${VERMELHO}✗${RESET} ${BRANCO}$1${RESET}"; log "OFF: $1"; FAILED_STEPS=$((FAILED_STEPS + 1)); }
 info() { echo -e "${CIANO}•${RESET} ${BRANCO}$1${RESET}"; log "INFO: $1"; }
@@ -77,6 +97,7 @@ warn() { echo -e "${AMARELO}!${RESET} ${BRANCO}$1${RESET}"; log "WARN: $1"; }
 step() { echo -e "\n${AMARELO}▶${RESET} ${BRANCO}$1${RESET}\n"; log "STEP: $1"; }
 
 die() {
+  impa_telemetry "failed"
   off "$1"
   echo ""
   echo -e "${VERMELHO}Migração abortada. A VPS de origem NÃO foi destruída.${RESET}"
@@ -910,6 +931,7 @@ show_summary_and_confirm() {
     die "Confirmação inválida. Nada foi alterado."
   fi
   ok "Confirmação recebida — iniciando"
+  impa_telemetry "migration_confirmed"
 }
 
 # =============================================================================
@@ -2084,6 +2106,8 @@ main() {
   mkdir -p "$STATE_DIR"
   : > "$LOG_FILE"
   log "=== IMPA Migrator v.${IMPA_MIGRATOR_VERSION} start ==="
+  impa_telemetry_init
+  impa_telemetry "start"
 
   banner
   accept_credits
@@ -2105,6 +2129,7 @@ main() {
   install_origin_deps
   require_docker_swarm
   discovery
+  impa_telemetry "inventory_done"
   show_inventory
 
   if ! confirm_yn "Inventário correto? Continuar para configurar o destino"; then
@@ -2113,14 +2138,18 @@ main() {
 
   ask_destination
   preflight_destination
+  impa_telemetry "dest_connected"
   show_summary_and_confirm
 
   provision_destination
   transfer_root_preflight
   bootstrap_dest_infra
+  impa_telemetry "bootstrap_done"
   freeze_origin
   transfer_all
+  impa_telemetry "volumes_done"
   deploy_application_stacks
+  impa_telemetry "deploy_done"
   validate_migration
 
   if [ "$ORIGIN_MODE" = "test" ]; then
@@ -2128,6 +2157,7 @@ main() {
   fi
 
   final_report
+  impa_telemetry "completed"
 
   log "=== IMPA Migrator v.${IMPA_MIGRATOR_VERSION} end ==="
 }
