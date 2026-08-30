@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.11"
+IMPA_MIGRATOR_VERSION="1.1.12"
 
 # =============================================================================
 # Cores / UI
@@ -290,6 +290,11 @@ build_ssh() {
 remote() {
   # -n evita o SSH roubar stdin (quebrava loops e deploy parcial de stacks)
   "${SSH_BASE[@]}" -n "${DEST_USER}@${DEST_IP}" "$@"
+}
+
+remote_script() {
+  # Heredoc / pipe → bash -s no destino (NÃO usar -n, senão o script chega vazio)
+  "${SSH_BASE[@]}" "${DEST_USER}@${DEST_IP}" "$@"
 }
 
 remote_stream() {
@@ -737,7 +742,7 @@ preflight_destination() {
   ok "SSH conectado"
 
   local remote_check
-  remote_check=$(remote 'bash -s' <<'REMOTE'
+  remote_check=$(remote_script 'bash -s' <<'REMOTE'
 set -e
 . /etc/os-release 2>/dev/null || { echo "OS_FAIL"; exit 0; }
 echo "OS=$ID"
@@ -762,6 +767,10 @@ REMOTE
   dest_arch=$(echo "$remote_check" | grep '^ARCH=' | cut -d= -f2)
   dest_free=$(echo "$remote_check" | grep '^FREE=' | cut -d= -f2)
   dest_docker=$(echo "$remote_check" | grep '^DOCKER=' | cut -d= -f2)
+
+  if [ -z "$dest_os" ] || [ "$dest_os" = "OS_FAIL" ]; then
+    die "Não detectou SO no destino (esperado Debian/Ubuntu). Saída SSH: $(echo "$remote_check" | tr '\n' ' ' | head -c 200)"
+  fi
 
   case "$dest_os" in
     debian)
@@ -854,7 +863,7 @@ show_summary_and_confirm() {
 provision_destination() {
   step "Provisionando destino (Docker + Swarm)"
 
-  remote 'bash -s' <<'REMOTE' || die "Falha ao instalar Docker no destino"
+  remote_script 'bash -s' <<'REMOTE' || die "Falha ao instalar Docker no destino"
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -868,7 +877,7 @@ docker --version
 REMOTE
   ok "Docker instalado no destino"
 
-  remote 'bash -s' <<REMOTE || die "Falha ao iniciar Swarm no destino"
+  remote_script 'bash -s' <<REMOTE || die "Falha ao iniciar Swarm no destino"
 set -e
 STATE=\$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo inactive)
 if [ "\$STATE" != "active" ]; then
@@ -1148,7 +1157,7 @@ transfer_exported_stacks() {
 # Traefik v3.5 + Docker 29 quebra o provider Swarm (API 1.24 vs 1.40+) → 404 em tudo.
 patch_traefik_for_modern_docker() {
   step "Ajustando Traefik para Docker 29+"
-  remote 'bash -s' <<'PATCH' || { warn "Não foi possível ajustar traefik.yaml"; return 1; }
+  remote_script 'bash -s' <<'PATCH' || { warn "Não foi possível ajustar traefik.yaml"; return 1; }
 set -e
 [ -f /root/traefik.yaml ] || exit 0
 python3 <<'PY'
@@ -1247,7 +1256,7 @@ init_portainer_dest_api() {
   user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
   pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
 
-  result=$(remote "DOMAIN='$PORTAINER_DEST_DOMAIN' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE'
+  result=$(remote_script "DOMAIN='$PORTAINER_DEST_DOMAIN' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE'
 set -euo pipefail
 USER=$(echo "$USER_B64" | base64 -d)
 PASS=$(echo "$PASS_B64" | base64 -d)
@@ -1291,7 +1300,7 @@ deploy_stack_via_portainer() {
   remote "test -f /root/$file" || { off "YAML ausente no destino: $file"; return 1; }
 
   local out rc=0
-  out=$(remote "NAME='$name' YAML='/root/$file' bash -s" <<'REMOTE' 2>&1) || rc=$?
+  out=$(remote_script "NAME='$name' YAML='/root/$file' bash -s" <<'REMOTE' 2>&1) || rc=$?
 set -euo pipefail
 source /tmp/impa-portainer-api.env
 TOKEN=$(echo "$TOKEN_B64" | base64 -d)
