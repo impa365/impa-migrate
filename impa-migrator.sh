@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.10"
+IMPA_MIGRATOR_VERSION="1.1.11"
 
 # =============================================================================
 # Cores / UI
@@ -651,6 +651,24 @@ show_inventory() {
 # =============================================================================
 # Destino — perguntas + preflight
 # =============================================================================
+prompt_dest_password() {
+  local attempt label
+  DEST_PASSWORD=""
+  for attempt in 1 2 3; do
+    label="Senha SSH de ${DEST_USER}@${DEST_IP}"
+    if [ "$attempt" -gt 1 ]; then
+      label="${label} (tentativa ${attempt}/3)"
+    fi
+    read -r -s -p "$(echo -e "${AMARELO}${label}: ${RESET}")" DEST_PASSWORD
+    echo ""
+    if [ -n "$DEST_PASSWORD" ]; then
+      return 0
+    fi
+    warn "Senha vazia — tente de novo."
+  done
+  die "Senha não informada após 3 tentativas."
+}
+
 ask_destination() {
   step "Configurando VPS de destino"
   echo -e "${BRANCO}A VPS de destino DEVE ser nova/limpa (Debian 11–13 ou Ubuntu 20.04+), sem Docker.${RESET}"
@@ -685,9 +703,7 @@ ask_destination() {
         ;;
       2)
         DEST_AUTH_MODE="password"
-        read -r -s -p "$(echo -e "${AMARELO}Senha SSH de ${DEST_USER}@${DEST_IP}: ${RESET}")" DEST_PASSWORD
-        echo ""
-        [ -n "$DEST_PASSWORD" ] || die "Senha vazia."
+        prompt_dest_password
         break
         ;;
       *) echo -e "${VERMELHO}Digite 1 ou 2.${RESET}" ;;
@@ -700,9 +716,24 @@ ask_destination() {
 preflight_destination() {
   step "Preflight na VPS de destino ($DEST_IP)"
 
-  if ! remote "echo ok" >/dev/null 2>&1; then
-    die "Falha ao conectar via SSH em ${DEST_USER}@${DEST_IP}"
-  fi
+  local ssh_try=0
+  while [ "$ssh_try" -lt 3 ]; do
+    build_ssh
+    if remote "echo ok" >/dev/null 2>&1; then
+      break
+    fi
+    ssh_try=$((ssh_try + 1))
+    if [ "$ssh_try" -ge 3 ]; then
+      die "Falha ao conectar via SSH em ${DEST_USER}@${DEST_IP} após 3 tentativas."
+    fi
+    warn "Não conectou em ${DEST_USER}@${DEST_IP}."
+    if [ "$DEST_AUTH_MODE" = "password" ]; then
+      echo -e "${BRANCO}Verifique IP, usuário e senha — você pode tentar de novo.${RESET}"
+      prompt_dest_password
+    else
+      die "Verifique a chave SSH e o acesso a ${DEST_USER}@${DEST_IP}."
+    fi
+  done
   ok "SSH conectado"
 
   local remote_check
