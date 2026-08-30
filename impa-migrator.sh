@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.13"
+IMPA_MIGRATOR_VERSION="1.1.14"
 
 # =============================================================================
 # Cores / UI
@@ -196,8 +196,9 @@ choose_origin_mode() {
   echo -e "      Origem fica PAUSADA ao final. Ideal quando for apontar o DNS de vez."
   echo ""
   echo -e "  ${AMARELO}[2]${RESET} ${BRANCO}Teste (origem continua viva)${RESET}"
-  echo -e "      Após a cópia, a origem é RELIGADA. Você testa a VPS nova,"
-  echo -e "      aponta DNS se quiser e ainda pode voltar o DNS para a antiga."
+  echo -e "      Após a cópia, a origem é RELIGADA. Você aponta o DNS pro destino"
+  echo -e "      na hora do Portainer (igual cutover), testa a VPS nova e pode"
+  echo -e "      voltar o DNS pra origem se quiser."
   echo ""
   while true; do
     read -r -p "$(echo -e "${AMARELO}Escolha [1/2]: ${RESET}")" mode
@@ -843,7 +844,7 @@ show_summary_and_confirm() {
   echo -e "  3. Pausa origem e transfere volumes (consistência de banco)"
   echo -e "  4. Ativa no Portainer só as stacks que estavam ativas na origem (YAML extra em /root só copia)"
   if [ "$ORIGIN_MODE" = "test" ]; then
-    echo -e "  6. RELIGA a origem (você pode testar DNS na nova e voltar)"
+    echo -e "  6. RELIGA a origem — pode voltar o DNS pra origem depois de testar"
   else
     echo -e "  6. Origem permanece pausada (intacta para rollback)"
   fi
@@ -851,7 +852,11 @@ show_summary_and_confirm() {
   echo -e "       Traefik/Portainer sobem via docker stack deploy (podem ficar Limited — normal)."
   echo -e "       Demais stacks sobem via API do Portainer (controle total, como SetupOrion)."
   echo ""
-  echo -e "  ${VERMELHO}Após a migração, aponte o DNS A dos domínios para ${DEST_IP}${RESET}"
+  portainer_dest_domain
+  echo -e "  ${AMARELO}DNS:${RESET} na etapa do Portainer, ${PORTAINER_DEST_DOMAIN} → ${DEST_IP}"
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "       (modo teste: no final pode reverter o DNS pra origem)"
+  fi
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
 
@@ -1177,6 +1182,13 @@ orig = t
 if not re.search(r"traefik:v3\.(?:6|7)", t):
     t = re.sub(r"image:\s*traefik:v[\d.]+", "image: traefik:v3.6.1", t)
 
+net_m = re.search(r'--providers\.docker\.network=([^\s"]+)', t)
+swarm_net_m = re.search(r'--providers\.swarm\.network=([^\s"]+)', t)
+network = (swarm_net_m or net_m).group(1) if (swarm_net_m or net_m) else "OrionNet"
+
+# Traefik v3 removeu providers.docker.swarmMode — usar providers.swarm
+t = re.sub(r'\s*- "--providers\.docker\.swarmMode=true"[^\n]*\n', "\n", t)
+t = re.sub(r'\s*- "--providers\.docker\.network=[^"]+"[^\n]*\n', "\n", t)
 for rm in (
     '      - "--providers.docker.endpoint=unix:///var/run/docker.sock"\n',
     '      - "--providers.docker.exposedbydefault=false"\n',
@@ -1188,15 +1200,31 @@ t = t.replace(
 )
 t = t.replace('      - "--providers.docker.network=OrionNet"\n', "")
 
-swarm = '      - "--providers.swarm=true"\n'
 swarm_cfg = (
-    '      - "--providers.swarm=true"\n'
-    '      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"\n'
-    '      - "--providers.swarm.exposedbydefault=false"\n'
-    '      - "--providers.swarm.network=OrionNet"\n'
+    f'      - "--providers.swarm=true"\n'
+    f'      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"\n'
+    f'      - "--providers.swarm.exposedbydefault=false"\n'
+    f'      - "--providers.swarm.network={network}"\n'
 )
-if swarm in t and "providers.swarm.endpoint" not in t:
-    t = t.replace(swarm, swarm_cfg)
+if "providers.swarm=true" not in t:
+    if '      - "--api.dashboard=true"\n' in t:
+        t = t.replace(
+            '      - "--api.dashboard=true"\n',
+            '      - "--api.dashboard=true"\n' + swarm_cfg,
+            1,
+        )
+    else:
+        t = t.replace("    command:\n", "    command:\n" + swarm_cfg, 1)
+elif f"providers.swarm.network={network}" not in t:
+    t = re.sub(
+        r'\s*- "--providers\.swarm\.network=[^"]+"[^\n]*\n',
+        f'      - "--providers.swarm.network={network}"\n',
+        t,
+        count=1,
+    )
+
+# Traefik v3 + Swarm provider: middlewares usam @swarm
+t = t.replace("@docker", "@swarm")
 
 if "DOCKER_API_VERSION" not in t:
     needle = '    volumes:\n      - "vol_certificates:/etc/traefik/letsencrypt"'
@@ -1277,9 +1305,13 @@ require_dns_to_dest() {
     echo -e "${BRANCO}IP da VPS antiga (origem):${RESET} ${CIANO}${ORIGIN_PUBLIC_IP}${RESET}"
   fi
   echo ""
-  echo -e "${VERMELHO}O Portainer e os apps só funcionam se o DNS apontar para a VPS NOVA.${RESET}"
-  echo -e "${BRANCO}Atualize o registro A (ou Cloudflare → ${DEST_IP}) e aguarde a propagação.${RESET}"
-  echo -e "${BRANCO}Sem isso o admin do Portainer não é criado e a migração não continua.${RESET}"
+  echo -e "${VERMELHO}Altere o registro A de ${domain} para ${DEST_IP} (Hostinger/Cloudflare).${RESET}"
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "${BRANCO}Modo teste: DNS pro destino agora → migra → testa → no final a origem religa e você pode reverter o DNS.${RESET}"
+  else
+    echo -e "${BRANCO}Modo cutover: DNS fica no destino; a origem permanece pausada ao final.${RESET}"
+  fi
+  echo -e "${BRANCO}Aguarde a propagação. O script só continua quando ${domain} resolver para ${DEST_IP}.${RESET}"
   echo ""
 
   while true; do
@@ -1312,14 +1344,14 @@ require_dns_to_dest() {
     elif [ -n "$resolved" ]; then
       warn "$domain → $resolved (esperado: ${DEST_IP})"
       if [ -n "$ORIGIN_PUBLIC_IP" ] && [ "$resolved" = "$ORIGIN_PUBLIC_IP" ]; then
-        echo -e "${VERMELHO}Ainda aponta para a VPS ANTIGA — troque o A record antes de continuar.${RESET}"
+        echo -e "${VERMELHO}Ainda aponta para a VPS ANTIGA — altere o A record para ${DEST_IP}.${RESET}"
       fi
     else
       warn "Não resolveu $domain (propagação ou registro ausente)"
     fi
 
     echo ""
-    read -r -p "$(echo -e "${AMARELO}Aponte o DNS e pressione ENTER para verificar de novo (Ctrl+C cancela): ${RESET}")" _
+    read -r -p "$(echo -e "${AMARELO}Alterou o DNS para ${DEST_IP}? Pressione ENTER para verificar de novo (Ctrl+C cancela): ${RESET}")" _
   done
 }
 

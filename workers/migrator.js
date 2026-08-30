@@ -8,7 +8,7 @@
 const SCRIPT_COMMIT = "8d46370b6f8e457cf79ce9d1983b305f72fd27bd";
 const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
-const VERSION = "1.1.13";
+const VERSION = "1.1.14";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
 
 function wantsScript(request, pathname) {
