@@ -85,6 +85,7 @@ impa_telemetry() {
   payload=$(printf '{"step":"%s","version":"%s","mode":"%s","run":"%s"}' \
     "$step" "$IMPA_MIGRATOR_VERSION" "${ORIGIN_MODE:-}" "${IMPA_TELEMETRY_RUN_ID:-}")
   ( curl -fsS -m 4 -X POST "$IMPA_TELEMETRY_URL" \
+      -A "IMPA-Migrator/${IMPA_MIGRATOR_VERSION}" \
       -H "Content-Type: application/json" \
       -d "$payload" >/dev/null 2>&1 & ) || true
 }

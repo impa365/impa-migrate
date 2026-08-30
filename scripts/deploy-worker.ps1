@@ -70,9 +70,10 @@ $metaObj = @{
   bindings = @(
     @{ type = "durable_object_namespace"; name = "TELEMETRY_DO"; class_name = "TelemetryStore" }
   )
-  migrations = @(
-    @{ tag = "v1-telemetry-do"; new_classes = @("TelemetryStore") }
-  )
+  migrations = @{
+    new_tag = "v1-telemetry-do"
+    new_sqlite_classes = @("TelemetryStore")
+  }
 }
 $meta = $metaObj | ConvertTo-Json -Compress -Depth 8
 
@@ -111,9 +112,23 @@ try {
   $resp = Invoke-RestMethod -Method PUT -Uri $uploadUri -Headers $uploadHeaders -Body $form
   Write-Host "WORKER_UPLOAD success=$($resp.success)"
 } catch {
-  Write-Host "WORKER_UPLOAD_FAIL"
-  $_.ErrorDetails.Message
-  throw
+  Write-Host "WORKER_UPLOAD with migration failed, retrying without migrations..."
+  $metaObj.Remove("migrations")
+  $meta = $metaObj | ConvertTo-Json -Compress -Depth 8
+  $sb = New-Object System.IO.MemoryStream
+  Add-TextPart "metadata" $null "application/json" $meta
+  Add-BinPart "migrator.js" "migrator.js" "application/javascript+module" $workerBytes
+  $end = $utf8.GetBytes("--$boundary--`r`n")
+  $sb.Write($end, 0, $end.Length)
+  $form = $sb.ToArray()
+  try {
+    $resp = Invoke-RestMethod -Method PUT -Uri $uploadUri -Headers $uploadHeaders -Body $form
+    Write-Host "WORKER_UPLOAD success=$($resp.success)"
+  } catch {
+    Write-Host "WORKER_UPLOAD_FAIL"
+    $_.ErrorDetails.Message
+    throw
+  }
 }
 
 # 4) Route migrator.impa365.com/* → worker
