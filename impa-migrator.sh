@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.18"
+IMPA_MIGRATOR_VERSION="1.1.19"
 
 # =============================================================================
 # Cores / UI
@@ -1161,6 +1161,7 @@ transfer_all() {
     echo -e "${AMARELO}[$i/$total]${RESET}"
     transfer_volume "$vol" || true
   done < "$VOLUMES_FILE"
+  fix_supabase_permissions_contingency
 }
 
 transfer_root_preflight() {
@@ -1168,6 +1169,7 @@ transfer_root_preflight() {
   echo -e "${BRANCO}Antes do freeze — só configuração, para subir Traefik/Portainer.${RESET}"
   transfer_root || die "Falha ao enviar /root para o destino."
   transfer_exported_stacks || die "Falha ao enviar compose do Portainer (prioridade sobre /root)."
+  fix_supabase_permissions_contingency
 }
 
 transfer_exported_stacks() {
@@ -1204,6 +1206,66 @@ transfer_exported_stacks() {
       warn "  $name exportado mas YAML ausente em impa-exported-stacks"
     fi
   done < "$EXPORTED_STACKS_LIST"
+}
+
+# Após tar /root ou volumes entre VPS, UIDs numéricos divergem (_apt=105 na origem, 100 no destino).
+# O Postgres do Supabase lê pgsodium_root.key em supabase_db_config — sem isso: "invalid secret key".
+fix_supabase_permissions_contingency() {
+  remote "test -d /root/supabase/docker/volumes/db/data" 2>/dev/null || return 0
+
+  info "Contingência Supabase: alinhando UID/GID de bind mounts e supabase_db_config"
+  local out rc=0
+  out=$(remote_script 'bash -s' <<'REMOTE' 2>&1) || rc=$?
+set -euo pipefail
+
+DATA_DIR="/root/supabase/docker/volumes/db/data"
+CONFIG_DIR="/var/lib/docker/volumes/supabase_db_config/_data"
+STORAGE_DIR="/root/supabase/docker/volumes/storage"
+
+if [ ! -d "$DATA_DIR" ]; then
+  echo "SKIP"
+  exit 0
+fi
+
+if [ -f "$DATA_DIR/PG_VERSION" ]; then
+  read -r PG_UID PG_GID < <(stat -c '%u %g' "$DATA_DIR/PG_VERSION")
+elif [ -d "$DATA_DIR/base" ]; then
+  read -r PG_UID PG_GID < <(stat -c '%u %g' "$DATA_DIR/base")
+else
+  read -r PG_UID PG_GID < <(stat -c '%u %g' "$DATA_DIR")
+fi
+
+# Fallback: _apt na origem SetupOrion/Supabase costuma ser 105
+if [ -z "${PG_UID:-}" ] || [ "$PG_UID" -eq 0 ]; then PG_UID=105; fi
+if [ -z "${PG_GID:-}" ] || [ "$PG_GID" -eq 0 ]; then PG_GID=104; fi
+
+if [ -d "$CONFIG_DIR" ]; then
+  chown -R "${PG_UID}:${PG_GID}" "$CONFIG_DIR"
+  [ -f "$CONFIG_DIR/pgsodium_root.key" ] && chmod 600 "$CONFIG_DIR/pgsodium_root.key"
+fi
+
+chown -R "${PG_UID}:${PG_GID}" "$DATA_DIR"
+
+if [ -d "$STORAGE_DIR" ]; then
+  chown -R "${PG_UID}:${PG_GID}" "$STORAGE_DIR"
+fi
+
+# Diagnóstico: mismatch nomeado (uid 105 = tcpdump no destino, _apt na origem)
+local_name=""
+local_name=$(getent passwd "$PG_UID" 2>/dev/null | cut -d: -f1 || true)
+echo "OK uid=${PG_UID} gid=${PG_GID} local_user=${local_name:-?}"
+REMOTE
+) || rc=$?
+
+  if [ "$rc" -eq 0 ] && echo "$out" | grep -q '^OK '; then
+    ok "Supabase: $(echo "$out" | grep '^OK ' | tail -1 | sed 's/^OK //')"
+    return 0
+  fi
+  if echo "$out" | grep -qx 'SKIP'; then
+    return 0
+  fi
+  warn "Contingência Supabase (não bloqueante): $(echo "$out" | tail -2 | tr '\n' ' ')"
+  return 0
 }
 
 # =============================================================================
@@ -1737,6 +1799,9 @@ deploy_application_stacks() {
 
     deploy_i=$((deploy_i + 1))
     info "[$deploy_i] Deploy via Portainer API: $name ($yaml)"
+    if [ "$name" = "supabase" ]; then
+      fix_supabase_permissions_contingency
+    fi
     if deploy_stack_via_portainer "$name" "$yaml"; then
       echo "$name" >> "$deployed_list"
       return 0
