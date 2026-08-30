@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.14"
+IMPA_MIGRATOR_VERSION="1.1.15"
 
 # =============================================================================
 # Cores / UI
@@ -55,6 +55,8 @@ PORTAINER_URL=""
 PORTAINER_USER=""
 PORTAINER_PASS=""
 PORTAINER_DEST_DOMAIN=""
+PORTAINER_ORIG_DOMAIN=""
+PORTAINER_TEMP_BOOTSTRAP=""
 ORIGIN_PUBLIC_IP=""
 FAILED_STEPS=0
 
@@ -840,7 +842,7 @@ show_summary_and_confirm() {
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
   echo -e "  1. Instala Docker + Swarm no destino"
-  echo -e "  2. Envia YAMLs/dados_vps, sobe Traefik/Portainer (DNS do Portainer deve apontar pro destino)"
+  echo -e "  2. Envia YAMLs/dados_vps, sobe Traefik/Portainer (domínio do Portainer → destino)"
   echo -e "  3. Pausa origem e transfere volumes (consistência de banco)"
   echo -e "  4. Ativa no Portainer só as stacks que estavam ativas na origem (YAML extra em /root só copia)"
   if [ "$ORIGIN_MODE" = "test" ]; then
@@ -852,10 +854,11 @@ show_summary_and_confirm() {
   echo -e "       Traefik/Portainer sobem via docker stack deploy (podem ficar Limited — normal)."
   echo -e "       Demais stacks sobem via API do Portainer (controle total, como SetupOrion)."
   echo ""
-  portainer_dest_domain
-  echo -e "  ${AMARELO}DNS:${RESET} na etapa do Portainer, ${PORTAINER_DEST_DOMAIN} → ${DEST_IP}"
+  detect_portainer_origin_domain
+  echo -e "  ${AMARELO}DNS Portainer:${RESET} na etapa bootstrap — mesmo domínio ou temporário novo"
+  echo -e "       Origem hoje: ${CIANO}${PORTAINER_ORIG_DOMAIN}${RESET} → ${DEST_IP}"
   if [ "$ORIGIN_MODE" = "test" ]; then
-    echo -e "       (modo teste: no final pode reverter o DNS pra origem)"
+    echo -e "       (modo teste: no final pode reverter DNS; domínio temp. evita mexer no A record da origem)"
   fi
   echo -e "${AMARELO}──────────────────────────────────────────────────────────────────────────────${RESET}"
   echo ""
@@ -1261,14 +1264,124 @@ deploy_stack_remote() {
 }
 
 portainer_dest_domain() {
+  [ -n "$PORTAINER_DEST_DOMAIN" ] && return 0
   local domain="${PORTAINER_URL#https://}"
   domain="${domain#http://}"
   domain="${domain%/}"
+  if [ -z "$domain" ]; then
+    domain=$(grep -oE 'Host\(`[^`]+`' /root/portainer.yaml /root/portainer.yml 2>/dev/null | head -1 | sed -E 's/.*Host\(`([^`]+)`.*/\1/' || true)
+  fi
   if [ -z "$domain" ]; then
     domain=$(remote "grep -oE 'Host\\(\\\`[^\\\`]+\\\`\\)' /root/portainer.yaml /root/impa-exported-stacks/portainer.yaml 2>/dev/null | head -1 | sed -E 's/Host\\(\\\`([^\\\`]+)\\\`\\)/\\1/'" 2>/dev/null | tr -d '\r' || true)
   fi
   [ -z "$domain" ] && domain="portainer.local"
   PORTAINER_DEST_DOMAIN="$domain"
+}
+
+validate_domain_name() {
+  local d="$1"
+  [ -n "$d" ] || return 1
+  [ "${#d}" -le 253 ] || return 1
+  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]
+}
+
+detect_portainer_origin_domain() {
+  local domain="${PORTAINER_URL#https://}"
+  domain="${domain#http://}"
+  domain="${domain%/}"
+  if [ -z "$domain" ]; then
+    domain=$(grep -oE 'Host\(`[^`]+`' /root/portainer.yaml /root/portainer.yml 2>/dev/null | head -1 | sed -E 's/.*Host\(`([^`]+)`.*/\1/' || true)
+  fi
+  [ -z "$domain" ] && domain="portainer.local"
+  PORTAINER_ORIG_DOMAIN="$domain"
+}
+
+ask_portainer_bootstrap_domain() {
+  detect_portainer_origin_domain
+  step "Domínio do Portainer no destino (bootstrap)"
+  echo -e "${BRANCO}Domínio na origem:${RESET} ${CIANO}${PORTAINER_ORIG_DOMAIN}${RESET}"
+  echo ""
+  echo -e "${BRANCO}Para criar o admin, o Traefik no destino precisa de um domínio com A record → ${DEST_IP}.${RESET}"
+  echo -e "${BRANCO}Só o Portainer usa este domínio agora — apps mantêm os domínios originais.${RESET}"
+  echo ""
+  echo -e "  ${AMARELO}[1]${RESET} ${BRANCO}Mesmo domínio${RESET} — alterar o A record existente"
+  echo -e "  ${AMARELO}[2]${RESET} ${BRANCO}Domínio temporário${RESET} — criar A record novo (recomendado)"
+  echo ""
+
+  while true; do
+    local choice="" new_domain=""
+    read -r -p "$(echo -e "${AMARELO}Escolha [1/2]: ${RESET}")" choice
+    case "$choice" in
+      1)
+        PORTAINER_DEST_DOMAIN="$PORTAINER_ORIG_DOMAIN"
+        PORTAINER_TEMP_BOOTSTRAP=""
+        ok "Bootstrap Portainer em: $PORTAINER_DEST_DOMAIN"
+        break
+        ;;
+      2)
+        while true; do
+          read -r -p "$(echo -e "${AMARELO}Domínio temporário (ex: portainer-migra.seudominio.com.br): ${RESET}")" new_domain
+          new_domain=$(echo "$new_domain" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          new_domain="${new_domain#https://}"
+          new_domain="${new_domain#http://}"
+          new_domain="${new_domain%/}"
+          if ! validate_domain_name "$new_domain"; then
+            warn "Domínio inválido — use letras, números, pontos e hífens."
+            continue
+          fi
+          if [ "$new_domain" = "$PORTAINER_ORIG_DOMAIN" ]; then
+            warn "Igual ao da origem — use a opção [1]."
+            continue
+          fi
+          break
+        done
+        PORTAINER_DEST_DOMAIN="$new_domain"
+        PORTAINER_TEMP_BOOTSTRAP="yes"
+        ok "Domínio temporário: $PORTAINER_DEST_DOMAIN"
+        info "Crie o A record ${PORTAINER_DEST_DOMAIN} → ${DEST_IP} (sem alterar ${PORTAINER_ORIG_DOMAIN})"
+        break
+        ;;
+      *)
+        echo -e "${VERMELHO}Digite 1 ou 2.${RESET}"
+        ;;
+    esac
+  done
+}
+
+apply_portainer_bootstrap_domain_on_dest() {
+  [ "$PORTAINER_TEMP_BOOTSTRAP" = "yes" ] || return 0
+  [ "$PORTAINER_DEST_DOMAIN" != "$PORTAINER_ORIG_DOMAIN" ] || return 0
+
+  step "Aplicando domínio temporário no portainer.yaml (destino)"
+  info "${PORTAINER_ORIG_DOMAIN} → ${PORTAINER_DEST_DOMAIN}"
+
+  remote_script "OLD='$PORTAINER_ORIG_DOMAIN' NEW='$PORTAINER_DEST_DOMAIN' bash -s" <<'REMOTE' || die "Não foi possível atualizar portainer.yaml no destino."
+set -euo pipefail
+python3 <<'PY'
+from pathlib import Path
+import os
+old = os.environ["OLD"]
+new = os.environ["NEW"]
+changed = False
+for p in (
+    Path("/root/portainer.yaml"),
+    Path("/root/portainer.yml"),
+    Path("/root/impa-exported-stacks/portainer.yaml"),
+):
+    if not p.is_file():
+        continue
+    text = p.read_text(encoding="utf-8")
+    if old not in text:
+        continue
+    p.write_text(text.replace(old, new), encoding="utf-8")
+    print(f"PATCHED:{p}")
+    changed = True
+if not changed:
+    raise SystemExit("NO_MATCH")
+PY
+REMOTE
+
+  ok "portainer.yaml no destino usa ${PORTAINER_DEST_DOMAIN}"
 }
 
 resolve_domain_a() {
@@ -1312,6 +1425,9 @@ require_dns_to_dest() {
     echo -e "${BRANCO}Modo cutover: DNS fica no destino; a origem permanece pausada ao final.${RESET}"
   fi
   echo -e "${BRANCO}Aguarde a propagação. O script só continua quando ${domain} resolver para ${DEST_IP}.${RESET}"
+  if [ "$PORTAINER_TEMP_BOOTSTRAP" = "yes" ]; then
+    echo -e "${BRANCO}Domínio temporário só para o Portainer — ${PORTAINER_ORIG_DOMAIN} na origem não precisa mudar.${RESET}"
+  fi
   echo ""
 
   while true; do
@@ -1512,6 +1628,8 @@ bootstrap_dest_infra() {
   fi
 
   if grep -qx "portainer" "$STACKS_FILE" 2>/dev/null; then
+    ask_portainer_bootstrap_domain
+    apply_portainer_bootstrap_domain_on_dest
     local yaml
     yaml=$(find_stack_yaml "portainer" 2>/dev/null || true)
     if [ -n "$yaml" ]; then
@@ -1771,20 +1889,34 @@ final_report() {
   echo -e "  Destino:     ${CIANO}${DEST_USER}@${DEST_IP}${RESET}"
   echo -e "  Dados:       ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  Modo:        ${CIANO}${ORIGIN_MODE}${RESET}"
-  if [ -n "$PORTAINER_URL" ]; then
+  if [ -n "$PORTAINER_DEST_DOMAIN" ]; then
+    if [ "$PORTAINER_TEMP_BOOTSTRAP" = "yes" ]; then
+      echo -e "  Portainer:   ${CIANO}https://${PORTAINER_DEST_DOMAIN}${RESET} ${AMARELO}(temporário — bootstrap)${RESET}"
+      echo -e "  Produção:    ${CIANO}https://${PORTAINER_ORIG_DOMAIN}${RESET} ${BRANCO}(aponte no cutover final)${RESET}"
+    else
+      echo -e "  Portainer:   ${CIANO}https://${PORTAINER_DEST_DOMAIN}${RESET}"
+    fi
+    echo -e "  Usuário:     ${CIANO}$PORTAINER_USER${RESET}"
+  elif [ -n "$PORTAINER_URL" ]; then
     echo -e "  Portainer:   ${CIANO}https://${PORTAINER_URL#https://}${RESET}"
     echo -e "  Usuário:     ${CIANO}$PORTAINER_USER${RESET}"
   fi
   echo ""
   echo -e "  ${AMARELO}PRÓXIMOS PASSOS:${RESET}"
-  echo -e "  1. Apontar os registros DNS A dos seus domínios para ${VERDE}${DEST_IP}${RESET}"
-  echo -e "  2. Aguardar propagação DNS e testar Traefik/Portainer/apps"
-  if [ "$ORIGIN_MODE" = "test" ]; then
-    echo -e "  3. A origem está ${VERDE}LIGADA${RESET} de novo — pode voltar o DNS se precisar"
-    echo -e "  4. Só cancele a VPS antiga quando tiver certeza da nova"
+  if [ "$PORTAINER_TEMP_BOOTSTRAP" = "yes" ]; then
+    echo -e "  1. Acesse o Portainer em ${VERDE}https://${PORTAINER_DEST_DOMAIN}${RESET} (domínio temporário)"
+    echo -e "  2. Aponte os demais domínios das apps para ${VERDE}${DEST_IP}${RESET}"
+    echo -e "  3. No cutover, troque ${PORTAINER_ORIG_DOMAIN} → ${DEST_IP} (ou mantenha o temp.)"
   else
-    echo -e "  3. A origem está ${AMARELO}PAUSADA${RESET} (intacta). Só desligue/cancele quando validar a nova"
-    echo -e "  4. Rollback (religar origem):"
+    echo -e "  1. Apontar os registros DNS A dos seus domínios para ${VERDE}${DEST_IP}${RESET}"
+    echo -e "  2. Aguardar propagação DNS e testar Traefik/Portainer/apps"
+  fi
+  if [ "$ORIGIN_MODE" = "test" ]; then
+    echo -e "  • A origem está ${VERDE}LIGADA${RESET} de novo — pode voltar o DNS se precisar"
+    echo -e "  • Só cancele a VPS antiga quando tiver certeza da nova"
+  else
+    echo -e "  • A origem está ${AMARELO}PAUSADA${RESET} (intacta). Só desligue/cancele quando validar a nova"
+    echo -e "  • Rollback (religar origem):"
     echo -e "       ${CIANO}docker service scale NOME=1${RESET}"
     echo -e "       ${CIANO}# ou: docker stack deploy -c /root/STACK.yaml STACK${RESET}"
   fi
