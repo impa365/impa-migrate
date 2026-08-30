@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.17"
+IMPA_MIGRATOR_VERSION="1.1.18"
 
 # =============================================================================
 # Cores / UI
@@ -37,7 +37,8 @@ DEST_USER="root"
 DEST_AUTH_MODE=""   # key | password
 DEST_SSH_KEY=""
 DEST_PASSWORD=""
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=30)
+DEST_KNOWN_HOSTS=""
+SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=30)
 SSH_BASE=()
 SCP_BASE=()
 
@@ -279,26 +280,39 @@ install_origin_deps() {
 # =============================================================================
 sanitize_dest_known_hosts() {
   [ -n "$DEST_IP" ] || return 0
+  mkdir -p "$STATE_DIR" "${HOME}/.ssh" 2>/dev/null || true
+  DEST_KNOWN_HOSTS="$STATE_DIR/dest_known_hosts"
+  : > "$DEST_KNOWN_HOSTS"
+  chmod 600 "$DEST_KNOWN_HOSTS" 2>/dev/null || true
+
+  # Entradas hasheadas não contêm o IP em texto — ssh-keygen -R sempre, sem grep
   local kh="${HOME}/.ssh/known_hosts"
-  [ -f "$kh" ] || return 0
-  if grep -qE "(^|,)${DEST_IP}([, ]|$)" "$kh" 2>/dev/null; then
+  if [ -f "$kh" ]; then
     ssh-keygen -f "$kh" -R "$DEST_IP" >/dev/null 2>&1 || true
-    log "known_hosts: removida chave antiga de $DEST_IP (VPS restaurada/reinstalada)"
+    ssh-keygen -f "$kh" -R "[${DEST_IP}]:22" >/dev/null 2>&1 || true
+    ssh-keygen -f "$kh" -R "${DEST_USER}@${DEST_IP}" >/dev/null 2>&1 || true
+    log "known_hosts: chaves antigas de ${DEST_IP} removidas (hash ou IP)"
   fi
 }
 
-build_ssh() {
+ssh_dest_opts() {
   sanitize_dest_known_hosts
-  SSH_BASE=(ssh "${SSH_OPTS[@]}")
-  SCP_BASE=(scp "${SSH_OPTS[@]}")
+  echo "-o" "UserKnownHostsFile=${DEST_KNOWN_HOSTS}" "-o" "StrictHostKeyChecking=accept-new"
+}
+
+build_ssh() {
+  local dest_kh_opts
+  dest_kh_opts=$(ssh_dest_opts)
+  SSH_BASE=(ssh "${SSH_OPTS[@]}" $dest_kh_opts)
+  SCP_BASE=(scp "${SSH_OPTS[@]}" $dest_kh_opts)
   if [ "$DEST_AUTH_MODE" = "key" ]; then
     SSH_BASE+=(-i "$DEST_SSH_KEY")
     SCP_BASE+=(-i "$DEST_SSH_KEY")
   elif [ "$DEST_AUTH_MODE" = "password" ]; then
     command -v sshpass >/dev/null 2>&1 || die "sshpass ausente (deveria ter sido instalado no início)."
     export SSHPASS="$DEST_PASSWORD"
-    SSH_BASE=(sshpass -e ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
-    SCP_BASE=(sshpass -e scp "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+    SSH_BASE=(sshpass -e ssh "${SSH_OPTS[@]}" $dest_kh_opts -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+    SCP_BASE=(sshpass -e scp "${SSH_OPTS[@]}" $dest_kh_opts -o PreferredAuthentications=password -o PubkeyAuthentication=no)
   fi
 }
 
@@ -741,20 +755,34 @@ ask_destination() {
 preflight_destination() {
   step "Preflight na VPS de destino ($DEST_IP)"
 
-  local ssh_try=0
+  local ssh_try=0 ssh_err=""
   while [ "$ssh_try" -lt 3 ]; do
     build_ssh
-    if remote "echo ok" >/dev/null 2>&1; then
-      break
-    fi
+    ssh_err=$(remote "echo ok" 2>&1) && break
     ssh_try=$((ssh_try + 1))
+
+    if echo "$ssh_err" | grep -qiE 'host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'; then
+      warn "Chave SSH do destino mudou (VPS restaurada/reinstalada) — limpando known_hosts…"
+      sanitize_dest_known_hosts
+      build_ssh
+      if ssh_err=$(remote "echo ok" 2>&1); then
+        break
+      fi
+    fi
+
     if [ "$ssh_try" -ge 3 ]; then
       die "Falha ao conectar via SSH em ${DEST_USER}@${DEST_IP} após 3 tentativas."
     fi
     warn "Não conectou em ${DEST_USER}@${DEST_IP}."
+    if [ -n "$ssh_err" ]; then
+      warn "SSH: $(echo "$ssh_err" | tail -2 | tr '\n' ' ' | sed 's/  */ /g')"
+    fi
     if [ "$DEST_AUTH_MODE" = "password" ]; then
-      echo -e "${BRANCO}Verifique IP, usuário e senha — você pode tentar de novo.${RESET}"
-      echo -e "${BRANCO}Se restaurou a VPS destino, a chave SSH antiga em known_hosts já foi limpa — tente de novo.${RESET}"
+      if echo "$ssh_err" | grep -qiE 'host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'; then
+        echo -e "${BRANCO}Causa: chave SSH antiga do destino. O script já limpou — tente de novo.${RESET}"
+      else
+        echo -e "${BRANCO}Verifique IP, usuário e senha — você pode tentar de novo.${RESET}"
+      fi
       sanitize_dest_known_hosts
       prompt_dest_password
     else
