@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.24"
+IMPA_MIGRATOR_VERSION="1.1.25"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -518,17 +518,24 @@ discovery() {
   : > "$STATE_DIR/volume_sizes.txt"
   echo ""
   info "Calculando tamanho dos volumes..."
+  local vol_i=0 vol_total
+  vol_total=$(wc -l < "$VOLUMES_FILE" | tr -d ' ')
+  [ "$vol_total" -lt 1 ] && vol_total=1
   while IFS= read -r vol || [ -n "$vol" ]; do
     [ -z "$vol" ] && continue
+    vol_i=$((vol_i + 1))
     local path="/var/lib/docker/volumes/${vol}/_data"
     local size=0
+    # Mostra progresso ANTES do du — volumes grandes podem levar minutos sem saída
+    echo -ne "  ${CIANO}[${vol_i}/${vol_total}]${RESET} ${BRANCO}${vol}${RESET} … medindo\r"
     if [ -d "$path" ]; then
       size=$(du -sb "$path" 2>/dev/null | awk '{print $1}')
       size=${size:-0}
     fi
     TOTAL_BYTES=$((TOTAL_BYTES + size))
     printf "%s\t%s\n" "$vol" "$size" >> "$STATE_DIR/volume_sizes.txt"
-    echo -e "  ${BRANCO}$vol${RESET}  $(human_bytes "$size")"
+    printf "  ${CIANO}[%s/%s]${RESET} ${BRANCO}%-40s${RESET} %s\n" \
+      "$vol_i" "$vol_total" "$vol" "$(human_bytes "$size")"
   done < "$VOLUMES_FILE"
 
   TOTAL_HUMAN=$(human_bytes "$TOTAL_BYTES")
