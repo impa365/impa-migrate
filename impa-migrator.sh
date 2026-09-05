@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.23"
+IMPA_MIGRATOR_VERSION="1.1.24"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -1389,7 +1389,7 @@ fix_supabase_permissions_contingency() {
 
   info "Contingência Supabase: alinhando UID/GID de bind mounts e supabase_db_config"
   local out rc=0
-  out=$(remote_script 'bash -s' <<'REMOTE' 2>&1) || rc=$?
+  out=$(remote_script 'bash -s' <<'REMOTE' 2>&1
 set -euo pipefail
 
 DATA_DIR="/root/supabase/docker/volumes/db/data"
