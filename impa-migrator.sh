@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.26"
+IMPA_MIGRATOR_VERSION="1.1.27"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -1527,8 +1527,14 @@ p = Path("/root/traefik.yaml")
 t = p.read_text(encoding="utf-8")
 orig = t
 
-if not re.search(r"traefik:v3\.(?:6|7)", t):
-    t = re.sub(r"image:\s*traefik:v[\d.]+", "image: traefik:v3.6.1", t)
+if not re.search(r"traefik:v?3\.(?:6|7)", t):
+    # Aceita traefik:2.11.2 e traefik:v2.x (origem SetupOrion costuma ser sem o 'v')
+    t2 = re.sub(r"image:\s*traefik:v?[\d.]+", "image: traefik:v3.6.1", t)
+    if t2 == t:
+        t2 = re.sub(r"image:\s*traefik:[^\s\"']+", "image: traefik:v3.6.1", t)
+    t = t2
+    if "image: traefik:v3.6.1" not in t:
+        raise SystemExit("FAIL: não foi possível atualizar a imagem do Traefik para v3.6.1")
 
 net_m = re.search(r'--providers\.docker\.network=([^\s"]+)', t)
 swarm_net_m = re.search(r'--providers\.swarm\.network=([^\s"]+)', t)
