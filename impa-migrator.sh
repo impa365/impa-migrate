@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.25"
+IMPA_MIGRATOR_VERSION="1.1.26"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -291,11 +291,16 @@ install_origin_deps() {
     die "Falha ao instalar dependências: ${missing[*]}. Rode: apt-get install -y ${missing[*]}"
   fi
 
-  # Obrigatórios — pv é opcional (só barra de progresso)
+  # Obrigatórios — pv é fortemente recomendado (barra de progresso na transferência)
   local required_bins=(curl jq sshpass tar ssh)
   for bin in "${required_bins[@]}"; do
     command -v "$bin" >/dev/null 2>&1 || die "Binário obrigatório ausente após install: $bin"
   done
+  if command -v pv >/dev/null 2>&1; then
+    ok "pv disponível (barra de progresso nas transferências)"
+  else
+    warn "pv não instalou — transferências sem barra de bytes (só contador de volume)"
+  fi
 
   ok "Dependências instaladas"
 }
@@ -1235,8 +1240,52 @@ unfreeze_origin() {
 # =============================================================================
 # Transfer
 # =============================================================================
+ensure_pv() {
+  if command -v pv >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "Instalando pv para barra de progresso..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null 2>&1 || true
+  apt-get install -y -qq pv >/dev/null 2>&1 || true
+  command -v pv >/dev/null 2>&1
+}
+
+# Pipe tar → destino com barra de bytes (pv -f funciona mesmo sem TTY / curl | bash)
+transfer_pipe() {
+  local label="$1" size="$2" remote_cmd="$3"
+  shift 3
+  # restantes: comando tar local (tar ... -cf - .)
+  if ensure_pv && [ "${size:-0}" -gt 0 ] 2>/dev/null; then
+    echo -e "  ${BRANCO}Progresso ${label}:${RESET}"
+    "$@" 2>/dev/null | pv -f -pterb -s "$size" | remote_stream "$remote_cmd"
+  elif ensure_pv; then
+    echo -e "  ${BRANCO}Progresso ${label} (sem tamanho prévio — só taxa):${RESET}"
+    "$@" 2>/dev/null | pv -f -pterb | remote_stream "$remote_cmd"
+  else
+    echo -e "  ${AMARELO}Sem pv — transferindo ${label} sem barra (pode demorar em silêncio)${RESET}"
+    local hb_pid=""
+    (
+      local n=0
+      while true; do
+        sleep 20
+        n=$((n + 20))
+        echo -e "  ${CIANO}… ainda transferindo ${label} (${n}s decorridos)${RESET}"
+      done
+    ) &
+    hb_pid=$!
+    "$@" 2>/dev/null | remote_stream "$remote_cmd"
+    local rc=$?
+    kill "$hb_pid" 2>/dev/null || true
+    wait "$hb_pid" 2>/dev/null || true
+    return $rc
+  fi
+}
+
 transfer_volume() {
   local vol="$1"
+  local idx="${2:-?}"
+  local total="${3:-?}"
   local src="/var/lib/docker/volumes/${vol}/_data"
   local size_line size
   size_line=$(grep -P "^${vol}\t" "$STATE_DIR/volume_sizes.txt" 2>/dev/null || true)
@@ -1246,37 +1295,31 @@ transfer_volume() {
   # Portainer guarda Swarm ID / stacks no volume — no destino o Swarm é novo.
   # Clonar portainer_data deixa a UI órfã. As stacks sobem pelo export da API + YAMLs.
   if [ "$vol" = "portainer_data" ]; then
-    warn "Pulando conteúdo de portainer_data (Swarm ID muda)"
+    warn "[$idx/$total] Pulando conteúdo de portainer_data (Swarm ID muda)"
     warn "Compose: ${PORTAINER_EXPORT_COUNT} ativa(s) no Portainer + YAMLs em /root (só ativas são deployadas)"
     return 0
   fi
 
   if [ ! -d "$src" ]; then
-    warn "Volume sem _data local: $vol (pulando conteúdo)"
+    warn "[$idx/$total] Volume sem _data local: $vol (pulando conteúdo)"
     return 0
   fi
-
-  info "Transferindo $vol ($(human_bytes "$size"))..."
 
   local attempt=1
   local max=3
   while [ "$attempt" -le "$max" ]; do
-    if command -v pv >/dev/null 2>&1 && [ "$size" -gt 0 ]; then
-      if tar -C "$src" -cf - . 2>/dev/null | pv -s "$size" | remote_stream "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
-        ok "Volume $vol transferido"
-        return 0
-      fi
-    else
-      if tar -C "$src" -cf - . 2>/dev/null | remote_stream "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -"; then
-        ok "Volume $vol transferido ($(human_bytes "$size"))"
-        return 0
-      fi
+    if transfer_pipe "$vol" "$size" \
+      "mkdir -p /var/lib/docker/volumes/${vol}/_data && tar -C /var/lib/docker/volumes/${vol}/_data -xf -" \
+      tar -C "$src" -cf - .
+    then
+      ok "[$idx/$total] Volume $vol transferido ($(human_bytes "$size"))"
+      return 0
     fi
-    warn "Tentativa $attempt/$max falhou para $vol — retry em 5s"
+    warn "[$idx/$total] Tentativa $attempt/$max falhou para $vol — retry em 5s"
     attempt=$((attempt + 1))
     sleep 5
   done
-  off "Falha ao transferir volume: $vol"
+  off "[$idx/$total] Falha ao transferir volume: $vol"
   return 1
 }
 
@@ -1300,28 +1343,16 @@ transfer_root() {
   local attempt=1
   local max=3
   while [ "$attempt" -le "$max" ]; do
-    if command -v pv >/dev/null 2>&1 && [ "${ROOT_BYTES:-0}" -gt 0 ]; then
-      if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
-        | pv -s "$ROOT_BYTES" \
-        | remote_stream "tar -C /root -xf -"; then
-        ok "Pasta /root transferida ($ROOT_HUMAN)"
-        # Sanity checks
-        remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
-        local yaml_dest
-        yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
-        ok "YAMLs no destino: $yaml_dest"
-        return 0
-      fi
-    else
-      if tar -C /root "${excludes[@]}" -cf - . 2>/dev/null \
-        | remote_stream "tar -C /root -xf -"; then
-        ok "Pasta /root transferida ($ROOT_HUMAN)"
-        remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
-        local yaml_dest
-        yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
-        ok "YAMLs no destino: $yaml_dest"
-        return 0
-      fi
+    if transfer_pipe "/root" "${ROOT_BYTES:-0}" "tar -C /root -xf -" \
+      tar -C /root "${excludes[@]}" -cf - .
+    then
+      ok "Pasta /root transferida ($ROOT_HUMAN)"
+      # Sanity checks
+      remote "test -d /root/dados_vps" && ok "dados_vps presente no destino" || warn "dados_vps não encontrado no destino"
+      local yaml_dest
+      yaml_dest=$(remote "ls /root/*.yaml /root/*.yml 2>/dev/null | wc -l" | tr -d ' \r' || echo 0)
+      ok "YAMLs no destino: $yaml_dest"
+      return 0
     fi
     warn "Tentativa $attempt/$max falhou ao copiar /root — retry em 5s"
     attempt=$((attempt + 1))
@@ -1333,15 +1364,45 @@ transfer_root() {
 
 transfer_all() {
   step "Transferindo volumes"
+  ensure_pv || true
   local i=0
-  local total
+  local total done_bytes=0 left
   total=$(wc -l < "$VOLUMES_FILE" | tr -d ' ')
+  [ "$total" -lt 1 ] && total=1
+  local grand="${TOTAL_BYTES:-0}"
+
+  echo -e "${BRANCO}Total estimado: ${CIANO}$(human_bytes "$grand")${RESET} em ${CIANO}${total}${RESET} volume(s)${RESET}"
+  echo -e "${BRANCO}Volumes grandes (ex.: chatwoot) podem levar muito tempo — a barra pv mostra taxa/ETA.${RESET}"
+  echo ""
+
   while IFS= read -r vol || [ -n "$vol" ]; do
     [ -z "$vol" ] && continue
     i=$((i + 1))
-    echo -e "${AMARELO}[$i/$total]${RESET}"
-    transfer_volume "$vol" || true
+    local size_line size
+    size_line=$(grep -P "^${vol}\t" "$STATE_DIR/volume_sizes.txt" 2>/dev/null || true)
+    size=$(echo "$size_line" | awk -F'\t' '{print $2}')
+    size=${size:-0}
+    if [ "${grand:-0}" -gt "$done_bytes" ] 2>/dev/null; then
+      left=$((grand - done_bytes))
+    else
+      left=0
+    fi
+
+    echo ""
+    echo -e "${AMARELO}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${CIANO}[${i}/${total}]${RESET} ${BRANCO}${vol}${RESET}"
+    echo -e "  Este volume: $(human_bytes "$size")  ·  Já copiado: $(human_bytes "$done_bytes") / $(human_bytes "$grand")  ·  Resta ~$(human_bytes "$left")"
+    echo -e "${AMARELO}──────────────────────────────────────────────────────────────${RESET}"
+
+    if transfer_volume "$vol" "$i" "$total"; then
+      done_bytes=$((done_bytes + size))
+    else
+      true
+    fi
   done < "$VOLUMES_FILE"
+
+  echo ""
+  ok "Transferência de volumes finalizada ($(human_bytes "$done_bytes") processados)"
   fix_supabase_permissions_contingency
 }
 
@@ -1979,16 +2040,19 @@ deploy_application_stacks() {
     fi
 
     deploy_i=$((deploy_i + 1))
-    info "[$deploy_i] Deploy via Portainer API: $name ($yaml)"
+    info "[$deploy_i/$stack_total] Deploy via Portainer API: $name ($yaml)"
+    echo -e "  ${BRANCO}Stack ${deploy_i} de ${stack_total} — aguarde a API criar os serviços…${RESET}"
     if [ "$name" = "supabase" ]; then
       fix_supabase_permissions_contingency
     fi
     if deploy_stack_via_portainer "$name" "$yaml"; then
+      ok "[$deploy_i/$stack_total] $name ativada"
       echo "$name" >> "$deployed_list"
       return 0
     fi
 
     echo "$name" >> "$failed_list"
+    off "[$deploy_i/$stack_total] Falha no deploy de $name"
     return 1
   }
 
