@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.27"
+IMPA_MIGRATOR_VERSION="1.1.28"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -42,7 +42,7 @@ DEST_AUTH_MODE=""   # key | password
 DEST_SSH_KEY=""
 DEST_PASSWORD=""
 DEST_KNOWN_HOSTS=""
-SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=30)
+SSH_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=120)
 SSH_BASE=()
 SCP_BASE=()
 
@@ -51,6 +51,8 @@ ORIGIN_VERSION=""
 ORIGIN_ARCH=""
 ORIGIN_SWARM=""
 ORIGIN_MODE=""      # cutover | test
+TRANSFER_RATE_LIMIT=""   # vazio = sem limite; ex: 12m, 25m (pv -L)
+TRANSFER_RATE_LABEL="sem limite"
 TOTAL_BYTES=0
 TOTAL_HUMAN="0B"
 ROOT_BYTES=0
@@ -234,6 +236,46 @@ choose_origin_mode() {
       1) ORIGIN_MODE="cutover"; ok "Modo: cutover (origem permanece pausada)"; break ;;
       2) ORIGIN_MODE="test"; ok "Modo: teste (origem será religada após a transferência)"; break ;;
       *) echo -e "${VERMELHO}Digite 1 ou 2.${RESET}" ;;
+    esac
+  done
+}
+
+choose_transfer_rate() {
+  step "Limite de velocidade na transferência"
+  echo -e "${BRANCO}Volumes grandes (ex.: 100GB+) em VPS fraca podem derrubar o destino sem limite.${RESET}"
+  echo -e "${BRANCO}A taxa vale para a cópia dos volumes e do /root (via pv).${RESET}"
+  echo ""
+  echo -e "  ${AMARELO}[1]${RESET} ${BRANCO}Sem limite${RESET}"
+  echo -e "      Máxima velocidade. Use só se a VPS destino aguentar disco/rede."
+  echo ""
+  echo -e "  ${AMARELO}[2]${RESET} ${BRANCO}Limite baixo — 12 MB/s${RESET} ${CIANO}(recomendado)${RESET}"
+  echo -e "      Rápido o bastante, bem mais estável (evita derrubar destino fraco)."
+  echo ""
+  echo -e "  ${AMARELO}[3]${RESET} ${BRANCO}Limite maior — 25 MB/s${RESET}"
+  echo -e "      Mais rápido que o baixo, ainda controlado."
+  echo ""
+  while true; do
+    read -r -p "$(echo -e "${AMARELO}Escolha [1/2/3]: ${RESET}")" rate
+    case "$rate" in
+      1)
+        TRANSFER_RATE_LIMIT=""
+        TRANSFER_RATE_LABEL="sem limite"
+        ok "Transferência sem limite de taxa"
+        break
+        ;;
+      2)
+        TRANSFER_RATE_LIMIT="12m"
+        TRANSFER_RATE_LABEL="12 MB/s (limite baixo)"
+        ok "Limite baixo: ~12 MB/s"
+        break
+        ;;
+      3)
+        TRANSFER_RATE_LIMIT="25m"
+        TRANSFER_RATE_LABEL="25 MB/s (limite maior)"
+        ok "Limite maior: ~25 MB/s"
+        break
+        ;;
+      *) echo -e "${VERMELHO}Digite 1, 2 ou 3.${RESET}" ;;
     esac
   done
 }
@@ -1048,6 +1090,7 @@ show_summary_and_confirm() {
   else
     echo -e "  Modo:     ${CIANO}CUTOVER${RESET} (origem permanece pausada)"
   fi
+  echo -e "  Taxa:     ${CIANO}${TRANSFER_RATE_LABEL}${RESET}"
   echo -e "  Tempo:    ~${ESTIMATED_MIN} min"
   echo ""
   echo -e "  ${AMARELO}O que acontece:${RESET}"
@@ -1255,15 +1298,23 @@ ensure_pv() {
 transfer_pipe() {
   local label="$1" size="$2" remote_cmd="$3"
   shift 3
+  local pv_opts=(-f -pterb)
+  if [ -n "${TRANSFER_RATE_LIMIT:-}" ]; then
+    pv_opts+=(-L "$TRANSFER_RATE_LIMIT")
+    echo -e "  ${CIANO}Taxa limitada: ${TRANSFER_RATE_LABEL}${RESET}"
+  fi
   # restantes: comando tar local (tar ... -cf - .)
   if ensure_pv && [ "${size:-0}" -gt 0 ] 2>/dev/null; then
     echo -e "  ${BRANCO}Progresso ${label}:${RESET}"
-    "$@" 2>/dev/null | pv -f -pterb -s "$size" | remote_stream "$remote_cmd"
+    "$@" 2>/dev/null | pv "${pv_opts[@]}" -s "$size" | remote_stream "$remote_cmd"
   elif ensure_pv; then
     echo -e "  ${BRANCO}Progresso ${label} (sem tamanho prévio — só taxa):${RESET}"
-    "$@" 2>/dev/null | pv -f -pterb | remote_stream "$remote_cmd"
+    "$@" 2>/dev/null | pv "${pv_opts[@]}" | remote_stream "$remote_cmd"
   else
     echo -e "  ${AMARELO}Sem pv — transferindo ${label} sem barra (pode demorar em silêncio)${RESET}"
+    if [ -n "${TRANSFER_RATE_LIMIT:-}" ]; then
+      warn "Limite de taxa exige pv — instalando/usando sem limite neste trecho."
+    fi
     local hb_pid=""
     (
       local n=0
@@ -1372,6 +1423,7 @@ transfer_all() {
   local grand="${TOTAL_BYTES:-0}"
 
   echo -e "${BRANCO}Total estimado: ${CIANO}$(human_bytes "$grand")${RESET} em ${CIANO}${total}${RESET} volume(s)${RESET}"
+  echo -e "${BRANCO}Taxa: ${CIANO}${TRANSFER_RATE_LABEL}${RESET}"
   echo -e "${BRANCO}Volumes grandes (ex.: chatwoot) podem levar muito tempo — a barra pv mostra taxa/ETA.${RESET}"
   echo ""
 
@@ -2278,6 +2330,7 @@ final_report() {
   echo -e "  Destino:     ${CIANO}${DEST_USER}@${DEST_IP}${RESET}"
   echo -e "  Dados:       ${CIANO}$TOTAL_HUMAN${RESET}"
   echo -e "  Modo:        ${CIANO}${ORIGIN_MODE}${RESET}"
+  echo -e "  Taxa cópia:  ${CIANO}${TRANSFER_RATE_LABEL}${RESET}"
   if [ -n "$PORTAINER_DEST_DOMAIN" ]; then
     if [ "$PORTAINER_TEMP_BOOTSTRAP" = "yes" ]; then
       echo -e "  Portainer:   ${CIANO}https://${PORTAINER_DEST_DOMAIN}${RESET} ${AMARELO}(temporário — bootstrap)${RESET}"
@@ -2342,6 +2395,7 @@ main() {
 
   backup_gate
   choose_origin_mode
+  choose_transfer_rate
 
   require_root
   validate_origin_os
