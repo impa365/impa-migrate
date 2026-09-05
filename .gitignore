@@ -1,5 +1,6 @@
 # Secrets — nunca subir
 senhacloud.txt
+access-emails.txt
 vps-test.env
 vps-test.local.env
 vps origem.txt

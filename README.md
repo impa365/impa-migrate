@@ -18,7 +18,7 @@ No navegador, `https://migrator.impa365.com` abre a landing da IMPA (copiar coma
 1. Créditos IMPA + versão no banner  
 2. **Backup altamente recomendado** (confirmação em até 3 etapas)  
 3. Modo **cutover** (origem fica pausada) ou **teste** (origem é religada)  
-4. Discovery: OS, Swarm, stacks, volumes, `/root`, export de stacks via API do Portainer  
+4. Discovery: OS, Swarm, stacks, volumes, `/root`; se há Portainer, **pede usuário/senha e valida na API** antes de exportar stacks  
 5. Preflight no destino (limpo, mesma arch, espaço)  
 6. Provision Docker + Swarm  
 7. Pausa origem → copia volumes + `/root` → sobe stacks  

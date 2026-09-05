@@ -8,7 +8,7 @@
 const SCRIPT_COMMIT = "7bcdeab7c34a1acfeef0d4d9db04de9256496741";
 const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
-const VERSION = "1.1.22";
+const VERSION = "1.1.23";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
 
 function wantsScript(request, pathname) {
@@ -287,6 +287,31 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+function fmtClock(iso, timeZone) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const g = (t) => parts.find((p) => p.type === t)?.value || "";
+  return `${g("year")}-${g("month")}-${g("day")} ${g("hour")}:${g("minute")}:${g("second")}`;
+}
+
+function fmtTs(iso) {
+  if (!iso) return "—";
+  const utc = fmtClock(iso, "UTC");
+  const br = fmtClock(iso, "America/Sao_Paulo");
+  if (!utc) return esc(String(iso));
+  return `<span class="ts"><b>${esc(br)}</b><small>${esc(utc)} UTC</small></span>`;
+}
+
 function dashboardPage(stats) {
   const servers = stats.servers || [];
   const recent = stats.recent || [];
@@ -313,14 +338,14 @@ function dashboardPage(stats) {
     .slice(0, 80)
     .map(
       (s) =>
-        `<tr><td><code>${esc(s.ip)}</code></td><td>${esc(s.lastStep)}</td><td>${esc(s.mode || "—")}</td><td>${esc(s.version || "—")}</td><td>${esc((s.lastSeen || "").replace("T", " ").slice(0, 19))}</td></tr>`
+        `<tr><td><code>${esc(s.ip)}</code></td><td>${esc(s.lastStep)}</td><td>${esc(s.mode || "—")}</td><td>${esc(s.version || "—")}</td><td>${fmtTs(s.lastSeen)}</td></tr>`
     )
     .join("");
   const eventRows = recent
     .slice(0, 80)
     .map(
       (e) =>
-        `<tr><td>${esc((e.ts || "").replace("T", " ").slice(0, 19))}</td><td><code>${esc(e.ip)}</code></td><td>${esc(e.step)}</td><td>${esc(e.mode || "—")}</td><td>${esc(e.version || "—")}</td></tr>`
+        `<tr><td>${fmtTs(e.ts)}</td><td><code>${esc(e.ip)}</code></td><td>${esc(e.step)}</td><td>${esc(e.mode || "—")}</td><td>${esc(e.version || "—")}</td></tr>`
     )
     .join("");
 
@@ -348,6 +373,10 @@ function dashboardPage(stats) {
   table{width:100%;border-collapse:collapse;font-size:.85rem}
   th,td{text-align:left;padding:.55rem .4rem;border-bottom:1px solid var(--border)}
   th{color:var(--muted);font-weight:600}
+  th .tz{display:block;font-size:.68rem;font-weight:500;opacity:.8;margin-top:.15rem}
+  .ts{display:flex;flex-direction:column;gap:2px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .ts b{font-weight:600;color:var(--fg)}
+  .ts small{color:var(--muted);font-size:.72rem}
   code{font-family:ui-monospace,Consolas,monospace;color:var(--cyan)}
   .box{background:var(--elev);border:1px solid var(--border);border-radius:12px;padding:1rem;overflow:auto}
   @media (max-width:800px){ .cards{grid-template-columns:1fr 1fr} .funnel-row{grid-template-columns:1fr} }
@@ -374,14 +403,14 @@ function dashboardPage(stats) {
     <h2>Servidores alcançados</h2>
     <div class="box">
       <table>
-        <thead><tr><th>IP</th><th>Última etapa</th><th>Modo</th><th>Versão</th><th>Último ping</th></tr></thead>
+        <thead><tr><th>IP</th><th>Última etapa</th><th>Modo</th><th>Versão</th><th>Último ping<br/><span class="tz">UTC-3 · UTC</span></th></tr></thead>
         <tbody>${serverRows || '<tr><td colspan="5">Nenhum servidor ainda.</td></tr>'}</tbody>
       </table>
     </div>
     <h2>Eventos recentes</h2>
     <div class="box">
       <table>
-        <thead><tr><th>Quando (UTC)</th><th>IP</th><th>Etapa</th><th>Modo</th><th>Versão</th></tr></thead>
+        <thead><tr><th>Quando<br/><span class="tz">UTC-3 · UTC</span></th><th>IP</th><th>Etapa</th><th>Modo</th><th>Versão</th></tr></thead>
         <tbody>${eventRows || '<tr><td colspan="5">Nenhum evento ainda.</td></tr>'}</tbody>
       </table>
     </div>

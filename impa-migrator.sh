@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.22"
+IMPA_MIGRATOR_VERSION="1.1.23"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -59,6 +59,10 @@ ESTIMATED_MIN=0
 PORTAINER_URL=""
 PORTAINER_USER=""
 PORTAINER_PASS=""
+PORTAINER_API_BASE=""
+PORTAINER_API_TOKEN=""
+PORTAINER_API_HOST=""
+PORTAINER_ORIGIN_VERIFIED=""
 PORTAINER_DEST_DOMAIN=""
 PORTAINER_ORIG_DOMAIN=""
 PORTAINER_TEMP_BOOTSTRAP=""
@@ -495,6 +499,7 @@ discovery() {
 
   # Lista do Portainer = fonte da verdade do que ATIVAR no destino (YAML em /root só copia)
   if grep -qx portainer "$STACKS_FILE" 2>/dev/null; then
+    ensure_origin_portainer_login || die "Login no Portainer de origem é obrigatório para exportar as stacks."
     export_stacks_from_portainer || die "Não foi possível listar stacks ativas do Portainer (obrigatório)."
     build_portainer_deploy_list
   else
@@ -550,6 +555,164 @@ discovery() {
   ok "Tempo estimado: ~${ESTIMATED_MIN} min (depende da rede)"
 }
 
+# =============================================================================
+# Portainer origem — login obrigatório + verificação real na API
+# =============================================================================
+portainer_origin_bases() {
+  local bases=()
+  local u domain
+  if [ -n "$PORTAINER_URL" ]; then
+    u="${PORTAINER_URL#https://}"
+    u="${u#http://}"
+    u="${u%/}"
+    bases+=("https://$u" "http://$u")
+  fi
+  detect_portainer_origin_domain
+  domain="$PORTAINER_ORIG_DOMAIN"
+  if [ -n "$domain" ] && [ "$domain" != "portainer.local" ]; then
+    bases+=("https://$domain" "http://$domain")
+  fi
+  # Acesso local direto (quando Portainer publica 9443/9000)
+  bases+=("https://127.0.0.1:9443" "http://127.0.0.1:9000" "https://localhost:9443" "http://localhost:9000")
+  printf '%s\n' "${bases[@]}"
+}
+
+# curl helper — com Host quando o login foi via Traefik local
+portainer_api_curl() {
+  local method="$1" path="$2"
+  shift 2
+  if [ -n "$PORTAINER_API_HOST" ]; then
+    curl -k -s --connect-timeout 8 -X "$method" \
+      -H "Host: $PORTAINER_API_HOST" \
+      -H "Authorization: Bearer $PORTAINER_API_TOKEN" \
+      "$@" \
+      "${PORTAINER_API_BASE}${path}"
+  else
+    curl -k -s --connect-timeout 8 -X "$method" \
+      -H "Authorization: Bearer $PORTAINER_API_TOKEN" \
+      "$@" \
+      "${PORTAINER_API_BASE}${path}"
+  fi
+}
+
+# Tenta autenticar. Sucesso → PORTAINER_API_BASE + TOKEN (+ HOST se Traefik). Retorna 0/1.
+portainer_try_login() {
+  local user="$1" pass="$2"
+  local base token payload domain
+  PORTAINER_API_BASE=""
+  PORTAINER_API_TOKEN=""
+  PORTAINER_API_HOST=""
+
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    die "jq obrigatório para autenticar no Portainer."
+  fi
+
+  payload=$(jq -n --arg u "$user" --arg p "$pass" '{username:$u,password:$p}')
+
+  while IFS= read -r base || [ -n "$base" ]; do
+    [ -z "$base" ] && continue
+    token=$(curl -k -s --connect-timeout 5 -X POST "$base/api/auth" \
+      -H "Content-Type: application/json" \
+      -d "$payload" 2>/dev/null \
+      | jq -r '.jwt // empty' 2>/dev/null || true)
+    if [ -n "$token" ] && [ "$token" != "null" ]; then
+      PORTAINER_API_BASE="$base"
+      PORTAINER_API_TOKEN="$token"
+      PORTAINER_API_HOST=""
+      return 0
+    fi
+  done < <(portainer_origin_bases)
+
+  # Portainer só atrás do Traefik (sem 9443 no host) — Host header em 127.0.0.1
+  detect_portainer_origin_domain
+  domain="$PORTAINER_ORIG_DOMAIN"
+  if [ -n "$domain" ] && [ "$domain" != "portainer.local" ]; then
+    for base in "https://127.0.0.1" "http://127.0.0.1" "https://127.0.0.1:443" "http://127.0.0.1:80"; do
+      token=$(curl -k -s --connect-timeout 5 -X POST "$base/api/auth" \
+        -H "Host: $domain" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null \
+        | jq -r '.jwt // empty' 2>/dev/null || true)
+      if [ -n "$token" ] && [ "$token" != "null" ]; then
+        PORTAINER_API_BASE="$base"
+        PORTAINER_API_TOKEN="$token"
+        PORTAINER_API_HOST="$domain"
+        return 0
+      fi
+    done
+  fi
+
+  return 1
+}
+
+ensure_origin_portainer_login() {
+  step "Login no Portainer de origem"
+  echo -e "${BRANCO}Precisamos das credenciais do Portainer que está rodando AGORA nesta VPS.${RESET}"
+  echo -e "${BRANCO}Sem isso não dá para exportar o compose das stacks (sobretudo sem YAMLs em /root).${RESET}"
+  echo ""
+
+  detect_portainer_origin_domain
+  if [ -n "$PORTAINER_ORIG_DOMAIN" ] && [ "$PORTAINER_ORIG_DOMAIN" != "portainer.local" ]; then
+    info "Domínio detectado: $PORTAINER_ORIG_DOMAIN (API pública + Traefik local)"
+  else
+    info "Sem domínio claro no YAML — vamos tentar Portainer local (9443/9000)"
+  fi
+  echo ""
+
+  # 1) Se veio de dados_portainer, valida de verdade
+  if [ -n "$PORTAINER_USER" ] && [ -n "$PORTAINER_PASS" ]; then
+    info "Testando credenciais de dados_portainer (usuário: $PORTAINER_USER)..."
+    if portainer_try_login "$PORTAINER_USER" "$PORTAINER_PASS"; then
+      PORTAINER_ORIGIN_VERIFIED="yes"
+      ok "Login confirmado no Portainer de origem ($PORTAINER_API_BASE${PORTAINER_API_HOST:+ Host $PORTAINER_API_HOST})"
+      return 0
+    fi
+    warn "dados_portainer NÃO autenticou nesta VPS — digite usuário/senha atuais."
+    PORTAINER_USER=""
+    PORTAINER_PASS=""
+    echo ""
+  fi
+
+  # 2) Pedir e conferir na API até acertar
+  local user="" pass="" attempts=0
+  while true; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -gt 5 ]; then
+      die "Muitas tentativas de login no Portainer. Confira o serviço e tente de novo."
+    fi
+
+    user=""
+    while [ -z "$user" ]; do
+      read -r -p "$(echo -e "${AMARELO}Usuário do Portainer de origem [admin]: ${RESET}")" user
+      user="${user:-admin}"
+    done
+
+    pass=""
+    while [ -z "$pass" ]; do
+      read -r -s -p "$(echo -e "${AMARELO}Senha do Portainer de origem: ${RESET}")" pass
+      echo ""
+      if [ -z "$pass" ]; then
+        warn "Senha vazia — digite de novo."
+      fi
+    done
+
+    info "Conferindo usuário/senha no Portainer..."
+    if portainer_try_login "$user" "$pass"; then
+      PORTAINER_USER="$user"
+      PORTAINER_PASS="$pass"
+      PORTAINER_ORIGIN_VERIFIED="yes"
+      ok "Senha correta — login OK em $PORTAINER_API_BASE${PORTAINER_API_HOST:+ (via Traefik Host $PORTAINER_API_HOST)}"
+      return 0
+    fi
+
+    warn "Usuário ou senha inválidos (Portainer rejeitou). Tente de novo."
+    echo ""
+  done
+}
+
 # Exporta stacks ATIVAS do Portainer (Status=1). YAML em /root é copiado, mas só isso ativa no destino.
 export_stacks_from_portainer() {
   step "Stacks ativas no Portainer (fonte da verdade para deploy)"
@@ -561,40 +724,14 @@ export_stacks_from_portainer() {
     die "jq obrigatório para listar stacks do Portainer."
   fi
 
-  if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
-    die "Credenciais do Portainer ausentes — necessárias para saber quais stacks ativar."
+  if [ "$PORTAINER_ORIGIN_VERIFIED" != "yes" ] || [ -z "$PORTAINER_API_TOKEN" ] || [ -z "$PORTAINER_API_BASE" ]; then
+    ensure_origin_portainer_login || die "Credenciais do Portainer ausentes — necessárias para saber quais stacks ativar."
   fi
 
-  local bases=()
-  local u
-  if [ -n "$PORTAINER_URL" ]; then
-    u="${PORTAINER_URL#https://}"
-    u="${u#http://}"
-    u="${u%/}"
-    bases+=("https://$u" "http://$u")
-  fi
-  # Acesso local (funciona mesmo se DNS ainda for externo)
-  bases+=("https://127.0.0.1:9443" "http://127.0.0.1:9000" "https://localhost:9443" "http://localhost:9000")
-
-  local base token=""
-  for base in "${bases[@]}"; do
-    token=$(curl -k -s --connect-timeout 5 -X POST "$base/api/auth" \
-      -H "Content-Type: application/json" \
-      -d "{\"username\":\"$PORTAINER_USER\",\"password\":\"$PORTAINER_PASS\"}" 2>/dev/null \
-      | jq -r '.jwt // empty' 2>/dev/null || true)
-    if [ -n "$token" ] && [ "$token" != "null" ]; then
-      ok "Portainer API autenticada em $base"
-      break
-    fi
-    token=""
-  done
-
-  if [ -z "$token" ]; then
-    die "Não autenticou no Portainer — confira dados_portainer."
-  fi
+  ok "Usando sessão Portainer: $PORTAINER_API_BASE${PORTAINER_API_HOST:+ Host $PORTAINER_API_HOST}"
 
   local stacks_json
-  stacks_json=$(curl -k -s --connect-timeout 10 -H "Authorization: Bearer $token" "$base/api/stacks" 2>/dev/null || true)
+  stacks_json=$(portainer_api_curl GET "/api/stacks" 2>/dev/null || true)
   if [ -z "$stacks_json" ] || ! echo "$stacks_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
     die "Resposta inválida de /api/stacks no Portainer."
   fi
@@ -617,8 +754,7 @@ export_stacks_from_portainer() {
       continue
     fi
 
-    file_json=$(curl -k -s --connect-timeout 15 -H "Authorization: Bearer $token" \
-      "$base/api/stacks/${id}/file" 2>/dev/null || true)
+    file_json=$(portainer_api_curl GET "/api/stacks/${id}/file" 2>/dev/null || true)
     content=$(echo "$file_json" | jq -r '.StackFileContent // empty' 2>/dev/null || true)
 
     # Fallback: alguns Portainer embutem o conteúdo na listagem
@@ -1878,14 +2014,20 @@ deploy_application_stacks() {
 ensure_portainer_credentials() {
   grep -qx "portainer" "$STACKS_FILE" 2>/dev/null || return 0
 
+  # Já validamos no login da origem — reusa no admin do destino
+  if [ "$PORTAINER_ORIGIN_VERIFIED" = "yes" ] && [ -n "$PORTAINER_USER" ] && [ -n "$PORTAINER_PASS" ]; then
+    ok "Admin do destino usará as mesmas credenciais da origem ($PORTAINER_USER)"
+    return 0
+  fi
+
   if [ -n "$PORTAINER_USER" ] && [ -n "$PORTAINER_PASS" ]; then
     ok "Credenciais Portainer: $PORTAINER_USER (dados_vps)"
     return 0
   fi
 
-  step "Credenciais do Portainer"
-  echo -e "${BRANCO}Não encontramos dados_portainer em /root/dados_vps.${RESET}"
-  echo -e "${BRANCO}Com SetupOrion isso vem automático — em outras instalações você define aqui.${RESET}"
+  step "Credenciais do Portainer (destino)"
+  echo -e "${BRANCO}Não encontramos dados_portainer nem login da origem.${RESET}"
+  echo -e "${BRANCO}Defina usuário/senha para criar o admin no Portainer do destino.${RESET}"
   echo ""
 
   local user="" pass="" pass2=""
