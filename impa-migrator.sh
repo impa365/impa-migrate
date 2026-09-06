@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.30"
+IMPA_MIGRATOR_VERSION="1.1.31"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -1654,6 +1654,26 @@ PATCH
   ok "Traefik compatível com Docker 29+ (v3.6.1 + provider Swarm)"
 }
 
+# SetupOrion grava middlewares como sslheader@docker; com providers.swarm o ref correto é @swarm.
+# Sem isso o router some e o Traefik devolve 404 (ex.: chat.cybersac.cloud).
+patch_swarm_middleware_refs_on_dest() {
+  step "Ajustando referências Traefik @docker → @swarm nas stacks"
+  remote_script 'bash -s' <<'PATCH' || { warn "Falha ao patchar @docker→@swarm"; return 1; }
+set -e
+n=0
+for f in /root/*.yaml /root/*.yml /root/impa-exported-stacks/*.yaml /root/impa-exported-stacks/*.yml; do
+  [ -f "$f" ] || continue
+  if grep -q '@docker' "$f" 2>/dev/null; then
+    sed -i 's/@docker/@swarm/g' "$f"
+    echo "PATCHED:$f"
+    n=$((n+1))
+  fi
+done
+echo "COUNT:$n"
+PATCH
+  ok "Middlewares Traefik alinhados ao provider Swarm"
+}
+
 deploy_stack_remote() {
   local name="$1"
   local file="$2"
@@ -2023,6 +2043,7 @@ bootstrap_dest_infra() {
   ensure_portainer_credentials
 
   patch_traefik_for_modern_docker || true
+  patch_swarm_middleware_refs_on_dest || true
 
   if grep -qx "traefik" "$STACKS_FILE" 2>/dev/null; then
     local yaml
