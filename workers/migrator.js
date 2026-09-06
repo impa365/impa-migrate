@@ -8,7 +8,7 @@
 const SCRIPT_COMMIT = "53c78e94990ab23e79daf7bc51066f4ecdd3152f";
 const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
-const VERSION = "1.1.31";
+const VERSION = "1.1.32";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
 
 function wantsScript(request, pathname) {
@@ -75,16 +75,71 @@ function emptyStats() {
     byVersion: {},
     recent: [],
     servers: [],
+    pageViewSeen: {},
+    visitorDedupe: true,
   };
 }
 
+/** Dia civil em UTC-3 (America/Sao_Paulo), YYYY-MM-DD */
+function saoPauloDay(ts) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Sao_Paulo",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date(ts));
+  } catch {
+    return String(ts || "").slice(0, 10);
+  }
+}
+
+function prunePageViewSeen(stats, keepDays = 90) {
+  const seen = stats.pageViewSeen || {};
+  const keep = new Set();
+  for (let i = 0; i < keepDays; i++) {
+    keep.add(saoPauloDay(new Date(Date.now() - i * 86400000).toISOString()));
+  }
+  const next = {};
+  for (const [k, v] of Object.entries(seen)) {
+    if (keep.has(k.split("|")[0])) next[k] = v;
+  }
+  stats.pageViewSeen = next;
+}
+
 function applyEvent(stats, event) {
+  // Migração one-shot: contador antigo era pageview bruto (F5 inflava)
+  if (!stats.visitorDedupe) {
+    stats.pageViews = 0;
+    stats.pageViewSeen = {};
+    stats.visitorDedupe = true;
+    if (stats.byStep && stats.byStep.page_view) stats.byStep.page_view = 0;
+  }
+
   const step = event.step || "unknown";
+
+  if (step === "page_view") {
+    const ip = event.ip || "unknown";
+    if (!ip || ip === "unknown") return stats;
+    const key = `${saoPauloDay(event.ts)}|${ip}`;
+    stats.pageViewSeen = stats.pageViewSeen || {};
+    if (stats.pageViewSeen[key]) return stats; // mesmo IP no mesmo dia — ignora reload
+    stats.pageViewSeen[key] = 1;
+    prunePageViewSeen(stats);
+    stats.pageViews += 1;
+    stats.byStep[step] = (stats.byStep[step] || 0) + 1;
+    if (event.version) {
+      stats.byVersion[event.version] = (stats.byVersion[event.version] || 0) + 1;
+    }
+    stats.recent.unshift(event);
+    stats.recent = stats.recent.slice(0, 150);
+    return stats;
+  }
+
   stats.byStep[step] = (stats.byStep[step] || 0) + 1;
   if (event.version) {
     stats.byVersion[event.version] = (stats.byVersion[event.version] || 0) + 1;
   }
-  if (step === "page_view") stats.pageViews += 1;
   if (step === "start") stats.started += 1;
   if (step === "migration_confirmed") stats.confirmed += 1;
   if (step === "completed") stats.completed += 1;
@@ -93,7 +148,7 @@ function applyEvent(stats, event) {
   stats.recent.unshift(event);
   stats.recent = stats.recent.slice(0, 150);
 
-  if (step !== "page_view" && event.ip && event.ip !== "unknown") {
+  if (event.ip && event.ip !== "unknown") {
     const idx = stats.servers.findIndex((s) => s.ip === event.ip);
     const row = {
       ip: event.ip,
@@ -147,6 +202,14 @@ export class TelemetryStore {
   }
   async fetch(request) {
     let stats = (await this.ctx.storage.get("stats")) || emptyStats();
+    // Contador antigo era pageview bruto (F5 inflava) — migra uma vez
+    if (stats.visitorDedupe !== true) {
+      stats.pageViews = 0;
+      stats.pageViewSeen = {};
+      stats.visitorDedupe = true;
+      if (stats.byStep) stats.byStep.page_view = 0;
+      await this.ctx.storage.put("stats", stats);
+    }
     if (request.method === "POST") {
       const event = await request.json();
       stats = applyEvent(stats, event);
@@ -391,7 +454,7 @@ function dashboardPage(stats) {
       <p>Atualiza ao recarregar</p>
     </header>
     <div class="cards">
-      <div class="card"><span>Visitas no site</span><b>${stats.pageViews || 0}</b></div>
+      <div class="card"><span>Visitantes únicos (IP/dia)</span><b>${stats.pageViews || 0}</b></div>
       <div class="card"><span>Servidores únicos (IP)</span><b>${stats.uniqueIps || 0}</b></div>
       <div class="card"><span>Migrações iniciadas</span><b>${stats.started || 0}</b></div>
       <div class="card"><span>Confirmadas (MIGRAR)</span><b>${stats.confirmed || 0}</b></div>
