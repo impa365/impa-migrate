@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.28"
+IMPA_MIGRATOR_VERSION="1.1.29"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -1789,7 +1789,15 @@ REMOTE
 
 resolve_domain_a() {
   local domain="$1" ip=""
-  if command -v getent >/dev/null 2>&1; then
+  # Preferir resolvers públicos — getent/systemd-resolved na origem costuma cachear IP antigo
+  if command -v dig >/dev/null 2>&1; then
+    for dns in 1.1.1.1 8.8.8.8; do
+      ip=$(dig @"$dns" +time=2 +tries=1 +short A "$domain" 2>/dev/null \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+      [ -n "$ip" ] && break
+    done
+  fi
+  if [ -z "$ip" ] && command -v getent >/dev/null 2>&1; then
     ip=$(getent ahosts "$domain" 2>/dev/null | awk '{print $1; exit}')
   fi
   if [ -z "$ip" ] && command -v dig >/dev/null 2>&1; then
