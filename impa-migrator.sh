@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.29"
+IMPA_MIGRATOR_VERSION="1.1.30"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -2048,8 +2048,12 @@ bootstrap_dest_infra() {
       info "Aguardando Portainer (25s)..."
       sleep 25
       portainer_dest_domain
-      require_dns_to_dest "$PORTAINER_DEST_DOMAIN" "Portainer (obrigatório antes do admin)"
-      init_portainer_admin || die "Admin Portainer não criado — confira DNS, Traefik e logs do portainer."
+      # Admin ANTES do DNS: janela de setup do Portainer (~5 min) expira se esperarmos propagação.
+      # API via Traefik/localhost com Host header — não precisa do A record público ainda.
+      init_portainer_admin || die "Admin Portainer não criado — confira Traefik e logs do portainer."
+      require_dns_to_dest "$PORTAINER_DEST_DOMAIN" "Portainer (acesso externo / certificado)"
+      # Se DNS demorou e alguém abriu a UI no meio, garante login ainda válido
+      ensure_portainer_admin_alive || die "Admin Portainer indisponível após DNS — veja logs do portainer."
     else
       die "portainer.yaml ausente no destino."
     fi
@@ -2194,6 +2198,77 @@ ensure_portainer_credentials() {
   ok "Credenciais definidas para criar o admin no destino"
 }
 
+# Reinicia Portainer no destino (reseta janela de setup após timeout de segurança).
+restart_portainer_dest() {
+  info "Reiniciando Portainer no destino (reseta timeout de setup)..."
+  remote "docker service update --force portainer_portainer >/dev/null 2>&1" || true
+  local w
+  for w in $(seq 1 40); do
+    if remote "docker service ps portainer_portainer --filter desired-state=running --format '{{.CurrentState}}' 2>/dev/null | head -1 | grep -qi '^Running'"; then
+      sleep 8
+      return 0
+    fi
+    sleep 3
+  done
+  warn "Portainer ainda subindo após force update — seguindo mesmo assim"
+  sleep 10
+  return 0
+}
+
+# true se a UI/API indicar setup expirado (timeout.html).
+portainer_dest_is_setup_timed_out() {
+  local domain="${1:-$PORTAINER_DEST_DOMAIN}"
+  remote_script "DOMAIN='$domain' bash -s" <<'REMOTE' >/dev/null 2>&1
+for BASE in "https://127.0.0.1" "http://127.0.0.1:9000"; do
+  BODY=$(curl -sk -L --max-time 8 -H "Host: $DOMAIN" "$BASE/" 2>/dev/null || true)
+  if echo "$BODY" | grep -qiE 'timed out for security|timeout\.html|re-enable your Portainer'; then
+    exit 0
+  fi
+  RESP=$(curl -sk --max-time 8 -X POST "$BASE/api/users/admin/init" -H "Host: $DOMAIN" \
+    -H "Content-Type: application/json" -d '{}' 2>/dev/null || true)
+  if echo "$RESP" | grep -qiE 'timed out|timeout|expired'; then
+    exit 0
+  fi
+done
+exit 1
+REMOTE
+}
+
+# Login admin ok no destino?
+portainer_dest_admin_auth_ok() {
+  local domain="${1:-$PORTAINER_DEST_DOMAIN}"
+  [ -n "$PORTAINER_USER" ] && [ -n "$PORTAINER_PASS" ] || return 1
+  local user_b64 pass_b64
+  user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
+  pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
+  remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' >/dev/null 2>&1
+USER=$(echo "$USER_B64" | base64 -d)
+PASS=$(echo "$PASS_B64" | base64 -d)
+if command -v jq >/dev/null 2>&1; then
+  PAYLOAD=$(jq -n --arg u "$USER" --arg p "$PASS" '{username:$u,password:$p}')
+else
+  PAYLOAD=$(printf '{"username":"%s","password":"%s"}' "$USER" "$PASS")
+fi
+for BASE in "https://127.0.0.1" "http://127.0.0.1:9000"; do
+  RESP=$(curl -sk --max-time 8 -X POST "$BASE/api/auth" -H "Host: $DOMAIN" \
+    -H "Content-Type: application/json" -d "$PAYLOAD" 2>/dev/null || true)
+  echo "$RESP" | grep -q '"jwt"' && exit 0
+done
+exit 1
+REMOTE
+}
+
+ensure_portainer_admin_alive() {
+  portainer_dest_domain
+  if portainer_dest_admin_auth_ok "$PORTAINER_DEST_DOMAIN"; then
+    ok "Admin Portainer ainda válido após DNS"
+    return 0
+  fi
+  warn "Admin não autentica após DNS — recuperando (restart + init)"
+  restart_portainer_dest
+  init_portainer_admin
+}
+
 init_portainer_admin() {
   step "Recriando admin do Portainer no destino"
   if [ -z "$PORTAINER_USER" ] || [ -z "$PORTAINER_PASS" ]; then
@@ -2203,48 +2278,95 @@ init_portainer_admin() {
 
   portainer_dest_domain
   local domain="$PORTAINER_DEST_DOMAIN"
-  local user_b64 pass_b64 out rc=0
+  local user_b64 pass_b64 out rc=0 cycle
+
+  # Já inicializado? (reexecução / pós-restart com volume)
+  if portainer_dest_admin_auth_ok "$domain"; then
+    ok "Admin Portainer já existe e autentica: $PORTAINER_USER (@$domain)"
+    return 0
+  fi
+
+  # Setup expirado (comum se DNS demorou) → força restart antes de tentar
+  if portainer_dest_is_setup_timed_out "$domain"; then
+    warn "Portainer em timeout de setup (segurança) — reiniciando serviço..."
+    restart_portainer_dest
+  fi
+
   user_b64=$(printf '%s' "$PORTAINER_USER" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_USER" | base64)
   pass_b64=$(printf '%s' "$PORTAINER_PASS" | base64 -w0 2>/dev/null || printf '%s' "$PORTAINER_PASS" | base64)
 
-  out=$(remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' 2>&1
+  for cycle in 1 2 3; do
+    out=$(remote_script "DOMAIN='$domain' USER_B64='$user_b64' PASS_B64='$pass_b64' bash -s" <<'REMOTE' 2>&1
 set -euo pipefail
 USER=$(echo "$USER_B64" | base64 -d)
 PASS=$(echo "$PASS_B64" | base64 -d)
 if command -v jq >/dev/null 2>&1; then
   PAYLOAD=$(jq -n --arg u "$USER" --arg p "$PASS" '{Username:$u,Password:$p}')
+  AUTH=$(jq -n --arg u "$USER" --arg p "$PASS" '{username:$u,password:$p}')
 else
   PAYLOAD=$(printf '{"Username":"%s","Password":"%s"}' "$USER" "$PASS")
+  AUTH=$(printf '{"username":"%s","password":"%s"}' "$USER" "$PASS")
 fi
 
-for i in $(seq 1 15); do
+for i in $(seq 1 12); do
+  # Detecta timeout de setup no meio das tentativas
+  for BASE in "https://127.0.0.1" "http://127.0.0.1:9000"; do
+    BODY=$(curl -sk -L --max-time 6 -H "Host: $DOMAIN" "$BASE/" 2>/dev/null || true)
+    if echo "$BODY" | grep -qiE 'timed out for security|timeout\.html|re-enable your Portainer'; then
+      echo "NEED_RESTART:setup_timeout"
+      exit 42
+    fi
+  done
+
   SETUP_TOKEN=$(docker service logs portainer_portainer 2>&1 | grep -oE 'setup_token=[a-f0-9]+' | tail -1 | cut -d= -f2 || true)
   for BASE in "https://127.0.0.1" "http://127.0.0.1:9000"; do
+    # Já criado?
+    AUTH_RESP=$(curl -sk --max-time 8 -X POST "$BASE/api/auth" -H "Host: $DOMAIN" \
+      -H "Content-Type: application/json" -d "$AUTH" 2>/dev/null || true)
+    if echo "$AUTH_RESP" | grep -q '"jwt"'; then echo "OK:exists"; exit 0; fi
+
     URL="${BASE}/api/users/admin/init"
     if [ -n "$SETUP_TOKEN" ]; then
-      RESP=$(curl -sk -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
+      RESP=$(curl -sk --max-time 8 -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
         -H "X-Setup-Token: $SETUP_TOKEN" -d "$PAYLOAD" 2>/dev/null || true)
     else
-      RESP=$(curl -sk -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
+      RESP=$(curl -sk --max-time 8 -X POST "$URL" -H "Host: $DOMAIN" -H "Content-Type: application/json" \
         -d "$PAYLOAD" 2>/dev/null || true)
     fi
     if echo "$RESP" | grep -q '"Username"'; then echo "OK:created"; exit 0; fi
     if echo "$RESP" | grep -qiE 'already|exists|initialized'; then echo "OK:exists"; exit 0; fi
+    if echo "$RESP" | grep -qiE 'timed out|timeout|expired'; then
+      echo "NEED_RESTART:api_timeout"
+      exit 42
+    fi
   done
-  sleep 6
+  sleep 5
 done
 echo "FAIL:timeout"
 exit 1
 REMOTE
 ) || rc=$?
-  if echo "$out" | grep -q '^OK:'; then
-    ok "Admin Portainer criado: $PORTAINER_USER (@$domain)"
-    return 0
-  fi
+
+    if echo "$out" | grep -q '^OK:'; then
+      ok "Admin Portainer criado: $PORTAINER_USER (@$domain)"
+      return 0
+    fi
+
+    if echo "$out" | grep -q 'NEED_RESTART' || [ "$rc" -eq 42 ]; then
+      warn "Ciclo $cycle/3: setup expirado — reiniciando Portainer e tentando de novo..."
+      restart_portainer_dest
+      rc=0
+      continue
+    fi
+
+    warn "Ciclo $cycle/3 falhou ($(echo "$out" | tail -2 | tr '\n' ' ')) — reiniciando Portainer..."
+    restart_portainer_dest
+    rc=0
+  done
 
   warn "Não foi possível criar o admin automaticamente."
   [ -n "$out" ] && warn "Detalhe: $(echo "$out" | tail -3 | tr '\n' ' ')"
-  warn "Verifique DNS → ${DEST_IP}, Traefik e: docker service logs portainer_portainer"
+  warn "Verifique Traefik e: docker service logs portainer_portainer"
   return 1
 }
 
