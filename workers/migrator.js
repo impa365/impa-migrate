@@ -8,7 +8,7 @@
 const SCRIPT_COMMIT = "53c78e94990ab23e79daf7bc51066f4ecdd3152f";
 const SCRIPT_URL = `https://raw.githubusercontent.com/impa365/impa-migrate/${SCRIPT_COMMIT}/impa-migrator.sh`;
 
-const VERSION = "1.1.32";
+const VERSION = "1.1.33";
 const INSTALL_CMD = "bash <(curl -sSL https://migrator.impa365.com)";
 
 function wantsScript(request, pathname) {
@@ -75,6 +75,7 @@ function emptyStats() {
     byVersion: {},
     recent: [],
     servers: [],
+    visitors: [],
     pageViewSeen: {},
     visitorDedupe: true,
   };
@@ -107,6 +108,46 @@ function prunePageViewSeen(stats, keepDays = 90) {
   stats.pageViewSeen = next;
 }
 
+function formatLoc(row) {
+  const parts = [row.city, row.region, row.country].filter(Boolean);
+  return parts.length ? parts.join(", ") : "—";
+}
+
+function upsertSiteVisitor(stats, event) {
+  const ip = event.ip;
+  if (!ip || ip === "unknown") return;
+  stats.visitors = stats.visitors || [];
+  const idx = stats.visitors.findIndex((v) => v.ip === ip);
+  const base = {
+    ip,
+    country: event.country || null,
+    city: event.city || null,
+    region: event.region || null,
+    lastSeen: event.ts,
+  };
+  if (idx >= 0) {
+    const prev = stats.visitors[idx];
+    stats.visitors[idx] = {
+      ...prev,
+      ...base,
+      country: base.country || prev.country,
+      city: base.city || prev.city,
+      region: base.region || prev.region,
+      firstSeen: prev.firstSeen || event.ts,
+      hits: (prev.hits || 1) + 1,
+    };
+    const [row] = stats.visitors.splice(idx, 1);
+    stats.visitors.unshift(row);
+  } else {
+    stats.visitors.unshift({
+      ...base,
+      firstSeen: event.ts,
+      hits: 1,
+    });
+  }
+  stats.visitors = stats.visitors.slice(0, 300);
+}
+
 function applyEvent(stats, event) {
   // Migração one-shot: contador antigo era pageview bruto (F5 inflava)
   if (!stats.visitorDedupe) {
@@ -121,9 +162,10 @@ function applyEvent(stats, event) {
   if (step === "page_view") {
     const ip = event.ip || "unknown";
     if (!ip || ip === "unknown") return stats;
+    upsertSiteVisitor(stats, event);
     const key = `${saoPauloDay(event.ts)}|${ip}`;
     stats.pageViewSeen = stats.pageViewSeen || {};
-    if (stats.pageViewSeen[key]) return stats; // mesmo IP no mesmo dia — ignora reload
+    if (stats.pageViewSeen[key]) return stats; // mesmo IP no mesmo dia — não soma visitante único
     stats.pageViewSeen[key] = 1;
     prunePageViewSeen(stats);
     stats.pageViews += 1;
@@ -152,6 +194,9 @@ function applyEvent(stats, event) {
     const idx = stats.servers.findIndex((s) => s.ip === event.ip);
     const row = {
       ip: event.ip,
+      country: event.country || null,
+      city: event.city || null,
+      region: event.region || null,
       firstSeen: idx >= 0 ? stats.servers[idx].firstSeen : event.ts,
       lastSeen: event.ts,
       lastStep: step,
@@ -159,8 +204,16 @@ function applyEvent(stats, event) {
       mode: event.mode,
       run: event.run || null,
     };
-    if (idx >= 0) stats.servers[idx] = { ...stats.servers[idx], ...row };
-    else {
+    if (idx >= 0) {
+      const prev = stats.servers[idx];
+      stats.servers[idx] = {
+        ...prev,
+        ...row,
+        country: row.country || prev.country,
+        city: row.city || prev.city,
+        region: row.region || prev.region,
+      };
+    } else {
       stats.uniqueIps += 1;
       stats.servers.unshift(row);
     }
@@ -238,6 +291,12 @@ async function handleTelemetry(request, env) {
     request.headers.get("CF-Connecting-IP") ||
     request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
     "unknown";
+  const cf = request.cf || {};
+  const country = String(cf.country || request.headers.get("CF-IPCountry") || "")
+    .slice(0, 8)
+    .toUpperCase() || null;
+  const city = String(cf.city || "").slice(0, 64) || null;
+  const region = String(cf.region || cf.regionCode || "").slice(0, 64) || null;
   const event = {
     ts: new Date().toISOString(),
     ip,
@@ -245,6 +304,9 @@ async function handleTelemetry(request, env) {
     version,
     mode: mode || null,
     run: run || null,
+    country: country || null,
+    city: city || null,
+    region: region || null,
   };
   console.log("[IMPA_TELEMETRY]", JSON.stringify(event));
   try {
@@ -255,11 +317,12 @@ async function handleTelemetry(request, env) {
   const hook = env?.TELEMETRY_WEBHOOK || null;
   if (hook && step !== "page_view") {
     try {
+      const loc = formatLoc(event);
       await fetch(hook, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          content: `**IMPA Migrator**\nIP: \`${ip}\`\nEtapa: **${step}**\nVersão: ${version}${mode ? `\nModo: ${mode}` : ""}`,
+          content: `**IMPA Migrator**\nIP: \`${ip}\`\nLocal: ${loc}\nEtapa: **${step}**\nVersão: ${version}${mode ? `\nModo: ${mode}` : ""}`,
         }),
       });
     } catch (e) {
@@ -377,6 +440,7 @@ function fmtTs(iso) {
 
 function dashboardPage(stats) {
   const servers = stats.servers || [];
+  const visitors = stats.visitors || [];
   const recent = stats.recent || [];
   const funnelOrder = [
     "start",
@@ -397,18 +461,25 @@ function dashboardPage(stats) {
       return `<div class="funnel-row"><span>${esc(k)}</span><div class="bar"><i style="width:${pct}%"></i></div><b>${n}</b></div>`;
     })
     .join("");
+  const visitorRows = visitors
+    .slice(0, 100)
+    .map(
+      (v) =>
+        `<tr><td><code>${esc(v.ip)}</code></td><td>${esc(formatLoc(v))}</td><td>${esc(String(v.hits || 1))}</td><td>${fmtTs(v.firstSeen)}</td><td>${fmtTs(v.lastSeen)}</td></tr>`
+    )
+    .join("");
   const serverRows = servers
     .slice(0, 80)
     .map(
       (s) =>
-        `<tr><td><code>${esc(s.ip)}</code></td><td>${esc(s.lastStep)}</td><td>${esc(s.mode || "—")}</td><td>${esc(s.version || "—")}</td><td>${fmtTs(s.lastSeen)}</td></tr>`
+        `<tr><td><code>${esc(s.ip)}</code></td><td>${esc(formatLoc(s))}</td><td>${esc(s.lastStep)}</td><td>${esc(s.mode || "—")}</td><td>${esc(s.version || "—")}</td><td>${fmtTs(s.lastSeen)}</td></tr>`
     )
     .join("");
   const eventRows = recent
     .slice(0, 80)
     .map(
       (e) =>
-        `<tr><td>${fmtTs(e.ts)}</td><td><code>${esc(e.ip)}</code></td><td>${esc(e.step)}</td><td>${esc(e.mode || "—")}</td><td>${esc(e.version || "—")}</td></tr>`
+        `<tr><td>${fmtTs(e.ts)}</td><td><code>${esc(e.ip)}</code></td><td>${esc(formatLoc(e))}</td><td>${esc(e.step)}</td><td>${esc(e.mode || "—")}</td><td>${esc(e.version || "—")}</td></tr>`
     )
     .join("");
 
@@ -449,7 +520,7 @@ function dashboardPage(stats) {
     <header>
       <div>
         <h1>IMPA Migrator · telemetria</h1>
-        <p>Quem usa, até onde chegou e quantos servidores únicos. Sem senhas ou dados de volume.</p>
+        <p>Quem visita o site, quem roda o script e até onde chegou. Sem senhas ou dados de volume.</p>
       </div>
       <p>Atualiza ao recarregar</p>
     </header>
@@ -461,20 +532,27 @@ function dashboardPage(stats) {
       <div class="card"><span>Concluídas</span><b>${stats.completed || 0}</b></div>
       <div class="card"><span>Falhas / abortadas</span><b>${stats.failed || 0}</b></div>
     </div>
+    <h2>Visitantes do site</h2>
+    <div class="box">
+      <table>
+        <thead><tr><th>IP</th><th>Localização</th><th>Hits</th><th>Primeiro acesso<br/><span class="tz">UTC-3 · UTC</span></th><th>Último acesso<br/><span class="tz">UTC-3 · UTC</span></th></tr></thead>
+        <tbody>${visitorRows || '<tr><td colspan="5">Nenhum visitante ainda — abra a landing uma vez.</td></tr>'}</tbody>
+      </table>
+    </div>
     <h2>Funil de etapas</h2>
     <div class="box">${funnelRows || "<p>Ainda sem eventos de migração.</p>"}</div>
     <h2>Servidores alcançados</h2>
     <div class="box">
       <table>
-        <thead><tr><th>IP</th><th>Última etapa</th><th>Modo</th><th>Versão</th><th>Último ping<br/><span class="tz">UTC-3 · UTC</span></th></tr></thead>
-        <tbody>${serverRows || '<tr><td colspan="5">Nenhum servidor ainda.</td></tr>'}</tbody>
+        <thead><tr><th>IP</th><th>Local</th><th>Última etapa</th><th>Modo</th><th>Versão</th><th>Último ping<br/><span class="tz">UTC-3 · UTC</span></th></tr></thead>
+        <tbody>${serverRows || '<tr><td colspan="6">Nenhum servidor ainda.</td></tr>'}</tbody>
       </table>
     </div>
     <h2>Eventos recentes</h2>
     <div class="box">
       <table>
-        <thead><tr><th>Quando<br/><span class="tz">UTC-3 · UTC</span></th><th>IP</th><th>Etapa</th><th>Modo</th><th>Versão</th></tr></thead>
-        <tbody>${eventRows || '<tr><td colspan="5">Nenhum evento ainda.</td></tr>'}</tbody>
+        <thead><tr><th>Quando<br/><span class="tz">UTC-3 · UTC</span></th><th>IP</th><th>Local</th><th>Etapa</th><th>Modo</th><th>Versão</th></tr></thead>
+        <tbody>${eventRows || '<tr><td colspan="6">Nenhum evento ainda.</td></tr>'}</tbody>
       </table>
     </div>
   </div>
