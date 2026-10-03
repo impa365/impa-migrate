@@ -2522,10 +2522,28 @@ final_report() {
   echo -e "${AMARELO}===================================================================================================${RESET}"
 }
 
+launch_web_panel() {
+  step "Iniciando Painel Web IMPA Migrate"
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+  if [ -n "$script_dir" ] && [ -f "$script_dir/impamigrate/install.sh" ]; then
+    bash "$script_dir/impamigrate/install.sh"
+  elif [ -f "/opt/impamigrate/install.sh" ]; then
+    bash "/opt/impamigrate/install.sh"
+  else
+    bash <(curl -sSL https://migrator.impa365.com/painel)
+  fi
+  exit 0
+}
+
 # =============================================================================
 # Main
 # =============================================================================
 main() {
+  if [ "${1:-}" = "--painel" ] || [ "${1:-}" = "--web" ] || [ "${1:-}" = "--panel" ]; then
+    launch_web_panel
+  fi
+
   mkdir -p "$STATE_DIR"
   : > "$LOG_FILE"
   log "=== IMPA Migrator v.${IMPA_MIGRATOR_VERSION} start ==="
@@ -2536,6 +2554,15 @@ main() {
   accept_credits
   clear 2>/dev/null || true
   banner
+
+  echo -e "  ${AMARELO}Como deseja executar a migração?${RESET}"
+  echo -e "  ${CIANO}1)${RESET} ${BRANCO}Painel Web Interativo${RESET} (Recomendado — Interface visual, progresso em tempo real e virada de DNS)"
+  echo -e "  ${CIANO}2)${RESET} ${BRANCO}Terminal Interativo Clássico${RESET} (Linha de comando nesta tela)"
+  echo ""
+  read -r -p "$(echo -e "${AMARELO}Escolha uma opção (1 ou 2) [1]: ${RESET}")" _exec_mode
+  if [ -z "$_exec_mode" ] || [ "$_exec_mode" = "1" ]; then
+    launch_web_panel
+  fi
 
   echo -e "${BRANCO}Migra ambientes Docker Swarm (Portainer/stacks/volumes) para uma VPS nova e limpa.${RESET}"
   echo -e "${BRANCO}SetupOrion recomendado (credenciais automáticas). Não clona o sistema operacional.${RESET}"

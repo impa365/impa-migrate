@@ -1,0 +1,23 @@
+services:
+  agent:
+    image: python:3.12-slim
+    container_name: impamigrate-agent
+    working_dir: /opt/impamigrate/agent
+    command: >
+      bash -c "apt-get update -qq && apt-get install -y -qq openssh-client sshpass pv curl >/dev/null 2>&1
+      && pip install -q -r requirements.txt
+      && python -m uvicorn app:app --host 0.0.0.0 --port 8899"
+    ports:
+      - "${MIGRATOR_PORT:-8899}:8899"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root:/root
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+      - /opt/impamigrate:/opt/impamigrate
+      - /var/log:/var/log
+    environment:
+      - MIGRATOR_TOKEN=${MIGRATOR_TOKEN}
+      - MIGRATOR_PORT=${MIGRATOR_PORT:-8899}
+      - MIGRATOR_PUBLIC_IP=${MIGRATOR_PUBLIC_IP:-}
+      - IMPA_MIGRATOR_VERSION=${IMPA_MIGRATOR_VERSION:-1.2.0}
+    restart: unless-stopped
