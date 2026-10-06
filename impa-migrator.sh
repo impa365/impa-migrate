@@ -5,7 +5,7 @@
 
 set -o pipefail
 
-IMPA_MIGRATOR_VERSION="1.1.31"
+IMPA_MIGRATOR_VERSION="1.2.0"
 
 # Telemetria de uso (etapa + versão + IP de origem) — sempre ativa
 IMPA_TELEMETRY_URL="${IMPA_TELEMETRY_URL:-https://migrator.impa365.com/telemetry}"
@@ -2531,7 +2531,7 @@ launch_web_panel() {
   elif [ -f "/opt/impamigrate/install.sh" ]; then
     bash "/opt/impamigrate/install.sh"
   else
-    bash <(curl -sSL https://migrator.impa365.com/painel)
+    bash <(curl -sSL https://migrator.impa365.com/panel)
   fi
   exit 0
 }

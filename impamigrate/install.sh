@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # IMPA Migrate — Painel Web de Migração Docker Swarm & VPS (IMPA 365)
-# Uso: bash install.sh   ou   bash <(curl -sSL https://migrator.impa365.com/painel)
+# Uso: bash install.sh   ou   bash <(curl -sSL https://migrator.impa365.com/panel)
 set -euo pipefail
 
 MIGRATOR_VERSION="1.2.0"
@@ -61,7 +61,7 @@ banner() {
 
 require_root() {
   if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
-    die "Você precisa executar este comando como root. Use: sudo bash <(curl -sSL https://migrator.impa365.com/painel)"
+    die "Você precisa executar este comando como root. Use: sudo bash <(curl -sSL https://migrator.impa365.com/panel)"
   fi
 }
 
@@ -131,6 +131,9 @@ deploy_container() {
 
     if [ ! -d "$INSTALL_DIR/agent" ]; then
       info "Clonando repositório oficial..."
+      if ! command -v git >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1 || true
+      fi
       git clone --depth 1 https://github.com/impa365/impa-migrate.git /tmp/impa-repo-dl 2>/dev/null || true
       if [ -d "/tmp/impa-repo-dl/impamigrate/agent" ]; then
         cp -r /tmp/impa-repo-dl/impamigrate/agent "$INSTALL_DIR/"
