@@ -27,6 +27,11 @@ ok() {
   log "OK: $1"
 }
 
+warn() {
+  echo -e "    ${YELLOW}⚠${RESET} ${YELLOW}$1${RESET}"
+  log "WARN: $1"
+}
+
 die() {
   echo ""
   echo -e "  ${RED}✖ ERRO:${RESET} ${WHITE}$1${RESET}"
@@ -113,6 +118,64 @@ EOF
   echo "$token"
 }
 
+is_port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    if ss -tulpn 2>/dev/null | grep -qE "[:.]${p}\b"; then
+      return 0
+    fi
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -i ":${p}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    if netstat -tulpn 2>/dev/null | grep -qE "[:.]${p}\b"; then
+      return 0
+    fi
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker ps --format '{{.Ports}}' 2>/dev/null | grep -qE "(:${p}->|0.0.0.0:${p}\b)"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+find_available_port() {
+  local target_port="${1:-8899}"
+
+  if is_port_in_use "$target_port"; then
+    local occupant=""
+    if command -v docker >/dev/null 2>&1; then
+      occupant=$(docker ps --filter "publish=${target_port}" --format 'Container {{.Names}} ({{.Image}})' 2>/dev/null | head -n1 || true)
+    fi
+    if [ -z "$occupant" ] && command -v ss >/dev/null 2>&1; then
+      occupant=$(ss -tulpn 2>/dev/null | grep -E "[:.]${target_port}\b" | head -n1 || true)
+    fi
+
+    if [ -n "$occupant" ]; then
+      warn "Porta ${target_port} já está em uso por: ${occupant}"
+    else
+      warn "Porta ${target_port} já está em uso por outro serviço no host."
+    fi
+
+    local candidate=$((target_port + 1))
+    while is_port_in_use "$candidate"; do
+      candidate=$((candidate + 1))
+      if [ $candidate -gt 8950 ]; then
+        candidate=9099
+        break
+      fi
+    done
+    info "Porta alternativa selecionada automaticamente: ${candidate}"
+    echo "$candidate"
+  else
+    echo "$target_port"
+  fi
+}
+
 deploy_container() {
   step "2/4" "Preparando diretórios e arquivos..."
   mkdir -p "$INSTALL_DIR" "$DADOS_DIR"
@@ -153,33 +216,48 @@ deploy_container() {
   local token="$1"
   local pub_ip="$2"
 
-  docker run -d \
-    --name impamigrate-agent \
-    --restart unless-stopped \
-    -p "${MIGRATOR_PORT}:8899" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /root:/root \
-    -v /var/lib/docker/volumes:/var/lib/docker/volumes \
-    -v "$INSTALL_DIR:/opt/impamigrate" \
-    -v /var/log:/var/log \
-    -e MIGRATOR_TOKEN="$token" \
-    -e MIGRATOR_PORT="8899" \
-    -e MIGRATOR_PUBLIC_IP="$pub_ip" \
-    -e IMPA_MIGRATOR_VERSION="$MIGRATOR_VERSION" \
-    python:3.12-slim bash -c "
-      apt-get update -qq && apt-get install -y -qq openssh-client sshpass pv curl >/dev/null 2>&1
-      && pip install -q fastapi 'uvicorn[standard]' pydantic httpx docker PyYAML jinja2 paramiko
-      && cd /opt/impamigrate/agent
-      && python -m uvicorn app:app --host 0.0.0.0 --port 8899
-    "
+  MIGRATOR_PORT="$(find_available_port "${MIGRATOR_PORT}")"
 
-  ok "Container impamigrate-agent iniciado com sucesso"
+  local max_retries=5
+  local started=0
+
+  for try in $(seq 1 $max_retries); do
+    docker rm -f impamigrate-agent 2>/dev/null || true
+
+    if docker run -d \
+      --name impamigrate-agent \
+      --restart unless-stopped \
+      -p "${MIGRATOR_PORT}:8899" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /root:/root \
+      -v /var/lib/docker/volumes:/var/lib/docker/volumes \
+      -v "$INSTALL_DIR:/opt/impamigrate" \
+      -v /var/log:/var/log \
+      -e MIGRATOR_TOKEN="$token" \
+      -e MIGRATOR_PORT="$MIGRATOR_PORT" \
+      -e MIGRATOR_PUBLIC_IP="$pub_ip" \
+      -e IMPA_MIGRATOR_VERSION="$MIGRATOR_VERSION" \
+      python:3.12-slim bash -c "apt-get update -qq && apt-get install -y -qq openssh-client sshpass pv curl >/dev/null 2>&1 && pip install -q fastapi 'uvicorn[standard]' pydantic httpx docker PyYAML jinja2 paramiko && cd /opt/impamigrate/agent && python -m uvicorn app:app --host 0.0.0.0 --port 8899" >/dev/null 2>&1; then
+      started=1
+      break
+    else
+      warn "Docker não conseguiu alocar a porta ${MIGRATOR_PORT}. Tentando porta $((MIGRATOR_PORT + 1))..."
+      MIGRATOR_PORT=$((MIGRATOR_PORT + 1))
+    fi
+  done
+
+  if [ "$started" -ne 1 ]; then
+    die "Falha ao iniciar container nas portas testadas. Verifique portas em uso com: ss -tulpn"
+  fi
+
+  ok "Container impamigrate-agent iniciado com sucesso na porta ${MIGRATOR_PORT}"
 }
 
 wait_healthy() {
   step "4/4" "Verificando inicialização da API..."
+  info "Aguardando dependências e inicialização do servidor..."
   local attempts=0
-  while [ $attempts -lt 25 ]; do
+  while [ $attempts -lt 40 ]; do
     if curl -fsS -m 2 "http://127.0.0.1:${MIGRATOR_PORT}/api/health" >/dev/null 2>&1; then
       ok "Painel online e respondendo na porta ${MIGRATOR_PORT}"
       return 0
